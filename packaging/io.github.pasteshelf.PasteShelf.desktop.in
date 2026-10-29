@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=PasteShelf
+Comment=Temporary shelf for dragged files and snippets
+Exec=@EXEC@
+Icon=io.github.pasteshelf.PasteShelf
+Terminal=false
+Categories=Utility;
+StartupNotify=true
+X-KDE-autostart-after=panel
