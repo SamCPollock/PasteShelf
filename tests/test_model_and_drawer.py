@@ -257,6 +257,60 @@ class ModelAndDrawerTests(unittest.TestCase):
         self.assertEqual(self.model.count, 1)
         self.assertEqual(self.model.draggingGroupId, "")
 
+    def test_file_drag_advertises_move_but_text_and_pinned_files_do_not(self) -> None:
+        source = Path(self.temp.name) / "movable.txt"
+        source.write_text("move me", encoding="utf-8")
+        offer = QMimeData()
+        offer.setUrls([QUrl.fromLocalFile(str(source))])
+        self.model.importMimeData(offer)
+        group = self.model.groups[0]
+        advertised_actions = []
+
+        class InspectingDrag:
+            def __init__(self, _parent):
+                pass
+
+            def setMimeData(self, _mime_data):
+                pass
+
+            def exec(self, actions, default_action):
+                advertised_actions.append((actions, default_action))
+                return Qt.DropAction.IgnoreAction
+
+            def deleteLater(self):
+                pass
+
+        with (
+            patch("pasteshelf.shelf_model.QDrag", InspectingDrag),
+            patch(
+                "pasteshelf.shelf_model.PreviewProvider.render_group",
+                return_value=QImage(),
+            ),
+        ):
+            self.model.beginDrag(group.id, "")
+            self.assertEqual(
+                advertised_actions.pop(),
+                (
+                    Qt.DropAction.CopyAction | Qt.DropAction.MoveAction,
+                    Qt.DropAction.CopyAction,
+                ),
+            )
+
+            self.model.togglePinned(group.id)
+            self.model.beginDrag(group.id, "")
+            self.assertEqual(
+                advertised_actions.pop(),
+                (Qt.DropAction.CopyAction, Qt.DropAction.CopyAction),
+            )
+
+        text_offer = QMimeData()
+        text_offer.setText("copy only")
+        self.model.importMimeData(text_offer)
+        self.assertEqual(
+            self.model._outbound_drag_actions(self.model.groups[-1]),
+            Qt.DropAction.CopyAction,
+        )
+
     def test_pinned_card_is_persisted_and_retained_after_successful_drag(self) -> None:
         offer = QMimeData()
         offer.setText("copy me repeatedly")

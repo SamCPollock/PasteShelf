@@ -299,15 +299,36 @@ class ShelfModel(QAbstractListModel):
         self._set_drag_active(True)
         result = Qt.DropAction.IgnoreAction
         try:
-            result = drag.exec(Qt.DropAction.CopyAction, Qt.DropAction.CopyAction)
+            result = drag.exec(
+                self._outbound_drag_actions(group, item_id),
+                Qt.DropAction.CopyAction,
+            )
         finally:
             self._set_drag_active(False)
             self.refreshMissing()
             drag.deleteLater()
-        if result == Qt.DropAction.CopyAction:
+        if result in (Qt.DropAction.CopyAction, Qt.DropAction.MoveAction):
             self._schedule_successful_drag_removal(group_id, item_id)
         else:
             self._set_drag_source("", "")
+
+    @staticmethod
+    def _outbound_drag_actions(
+        group: ShelfGroup, item_id: str = ""
+    ) -> Qt.DropAction:
+        selected = [
+            item for item in group.items if not item_id or item.id == item_id
+        ]
+        can_move = bool(selected) and not group.pinned and all(
+            item.kind in ("file", "folder")
+            and item.owned_path is None
+            and item.local_path is not None
+            and item.local_path.exists()
+            for item in selected
+        )
+        if can_move:
+            return Qt.DropAction.CopyAction | Qt.DropAction.MoveAction
+        return Qt.DropAction.CopyAction
 
     @Slot()
     def refreshMissing(self) -> None:

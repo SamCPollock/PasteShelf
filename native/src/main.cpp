@@ -594,6 +594,34 @@ public:
         return mime;
     }
 
+    Qt::DropActions outboundDragActions(const QString &id, const QString &itemId = {}) const
+    {
+        const ShelfGroup *entry = group(id);
+        if (!entry)
+            return Qt::IgnoreAction;
+
+        // Moving a pinned card would immediately make the retained reference
+        // stale. Likewise, PasteShelf-owned payloads must remain in its private
+        // content directory until their card is removed. Only advertise Move
+        // when every selected item is an existing, ordinary file-system entry.
+        bool selectedAny = false;
+        bool canMove = !entry->pinned;
+        for (const auto &item : entry->items) {
+            if (!itemId.isEmpty() && item.id != itemId)
+                continue;
+            selectedAny = true;
+            if (item.owned
+                || (item.kind != QLatin1String("file") && item.kind != QLatin1String("folder"))
+                || !QFileInfo::exists(item.value)) {
+                canMove = false;
+            }
+        }
+        if (!selectedAny)
+            return Qt::IgnoreAction;
+        return canMove ? Qt::DropActions(Qt::CopyAction | Qt::MoveAction)
+                       : Qt::DropActions(Qt::CopyAction);
+    }
+
     QPixmap preview(const ShelfGroup &group, const QSize &size) const
     {
         if (group.items.isEmpty())
@@ -1041,11 +1069,12 @@ protected:
         drag->setMimeData(mime.release());
         drag->setPixmap(grab().scaled(240, 44, Qt::KeepAspectRatio, Qt::SmoothTransformation));
         emit dragActiveChanged(true);
-        const auto action = drag->exec(Qt::CopyAction, Qt::CopyAction);
+        const auto action = drag->exec(
+            m_store->outboundDragActions(m_groupId, m_item.id), Qt::CopyAction);
         emit dragActiveChanged(false);
         drag->deleteLater();
         setCursor(Qt::OpenHandCursor);
-        if (action == Qt::CopyAction && !m_isPinned())
+        if ((action == Qt::CopyAction || action == Qt::MoveAction) && !m_isPinned())
             poof();
     }
 
@@ -1380,12 +1409,15 @@ protected:
         drag->setMimeData(mime.release());
         drag->setPixmap(grab().scaled(280, 110, Qt::KeepAspectRatio, Qt::SmoothTransformation));
         emit dragActiveChanged(true);
-        const auto action = drag->exec(Qt::CopyAction, Qt::CopyAction);
+        const auto action = drag->exec(
+            m_store->outboundDragActions(m_group.id), Qt::CopyAction);
         emit dragActiveChanged(false);
         drag->deleteLater();
         setCursor(Qt::OpenHandCursor);
-        if (action == Qt::CopyAction && !m_internalReorderAccepted && !m_pinned)
+        if ((action == Qt::CopyAction || action == Qt::MoveAction)
+            && !m_internalReorderAccepted && !m_pinned) {
             poof(true);
+        }
     }
 
     void mouseDoubleClickEvent(QMouseEvent *event) override
@@ -3353,6 +3385,15 @@ bool runSelfTest()
         if (!memberOutput || memberOutput->urls().size() != 1
             || memberOutput->urls().first().toLocalFile() != secondPath)
             return false;
+        const Qt::DropActions copyAndMove = Qt::CopyAction | Qt::MoveAction;
+        if (store.outboundDragActions(fileGroupId) != copyAndMove
+            || store.outboundDragActions(fileGroupId, secondItemId) != copyAndMove
+            || store.outboundDragActions(textGroupId) != Qt::CopyAction
+            || !store.setPinned(fileGroupId, true)
+            || store.outboundDragActions(fileGroupId) != Qt::CopyAction
+            || !store.setPinned(fileGroupId, false)) {
+            return false;
+        }
         CardWidget stackCard(*store.group(fileGroupId), &store);
         stackCard.setFixedWidth(370);
         stackCard.expandForTest();
