@@ -207,6 +207,9 @@ class ModelAndDrawerTests(unittest.TestCase):
             def exec(self, *_arguments):
                 return Qt.DropAction.CopyAction
 
+            def deleteLater(self):
+                pass
+
         with (
             patch("pasteshelf.shelf_model.QDrag", SuccessfulDrag),
             patch(
@@ -238,6 +241,9 @@ class ModelAndDrawerTests(unittest.TestCase):
             def exec(self, *_arguments):
                 return Qt.DropAction.IgnoreAction
 
+            def deleteLater(self):
+                pass
+
         with (
             patch("pasteshelf.shelf_model.QDrag", IgnoredDrag),
             patch(
@@ -267,6 +273,9 @@ class ModelAndDrawerTests(unittest.TestCase):
 
             def exec(self, *_arguments):
                 return Qt.DropAction.CopyAction
+
+            def deleteLater(self):
+                pass
 
         with (
             patch("pasteshelf.shelf_model.QDrag", SuccessfulDrag),
@@ -307,6 +316,9 @@ class ModelAndDrawerTests(unittest.TestCase):
 
             def exec(self, *_arguments):
                 return Qt.DropAction.CopyAction
+
+            def deleteLater(self):
+                pass
 
         with (
             patch("pasteshelf.shelf_model.QDrag", SuccessfulDrag),

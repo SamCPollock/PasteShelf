@@ -24,6 +24,7 @@
 #include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonObject>
+#include <QJsonParseError>
 #include <QLabel>
 #include <QLocalServer>
 #include <QLocalSocket>
@@ -50,6 +51,7 @@
 #include <QStyle>
 #include <QSystemTrayIcon>
 #include <QTemporaryDir>
+#include <QTextDocument>
 #include <QTimer>
 #include <QToolButton>
 #include <QUuid>
@@ -67,6 +69,7 @@ namespace {
 
 constexpr auto kInternalMime = "application/x-pasteshelf-native-item";
 constexpr auto kDesktopId = "io.github.pasteshelf.PasteShelfNative";
+constexpr qint64 kMaxOwnedPayloadBytes = 100LL * 1024LL * 1024LL;
 
 QString compactText(const QString &text, int maximum = 72)
 {
@@ -161,8 +164,19 @@ public:
           m_content(m_root + QStringLiteral("/content")),
           m_statePath(m_root + QStringLiteral("/state.json"))
     {
+        QDir().mkpath(m_root);
         QDir().mkpath(m_content);
+        const auto directoryPermissions = QFileDevice::ReadOwner | QFileDevice::WriteOwner
+            | QFileDevice::ExeOwner;
+        QFile::setPermissions(m_root, directoryPermissions);
+        QFile::setPermissions(m_content, directoryPermissions);
+        if (QFileInfo::exists(m_statePath)) {
+            QFile::setPermissions(m_statePath,
+                QFileDevice::ReadOwner | QFileDevice::WriteOwner);
+        }
         load();
+        if (m_storageWritable)
+            cleanupOrphans();
     }
 
     const QList<ShelfGroup> &groups() const { return m_groups; }
@@ -174,10 +188,43 @@ public:
         return it == m_groups.cend() ? nullptr : &*it;
     }
 
+    static bool hasImageOffer(const QMimeData *mime)
+    {
+        if (!mime)
+            return false;
+        if (mime->hasImage())
+            return true;
+        const QStringList formats = mime->formats();
+        return std::any_of(formats.cbegin(), formats.cend(),
+            [](const QString &format) { return format.startsWith(QLatin1String("image/")); });
+    }
+
+    static QImage imageFromMime(const QMimeData *mime)
+    {
+        if (!mime)
+            return {};
+        if (mime->hasImage()) {
+            QImage image = qvariant_cast<QImage>(mime->imageData());
+            if (!image.isNull())
+                return image;
+            const QPixmap pixmap = qvariant_cast<QPixmap>(mime->imageData());
+            if (!pixmap.isNull())
+                return pixmap.toImage();
+        }
+        for (const QString &format : mime->formats()) {
+            if (!format.startsWith(QLatin1String("image/")))
+                continue;
+            const QImage image = QImage::fromData(mime->data(format));
+            if (!image.isNull())
+                return image;
+        }
+        return {};
+    }
+
     static bool canImport(const QMimeData *mime)
     {
         return mime && !mime->hasFormat(kInternalMime)
-            && (mime->hasUrls() || mime->hasImage() || mime->hasHtml() || mime->hasText());
+            && (mime->hasUrls() || hasImageOffer(mime) || mime->hasHtml() || mime->hasText());
     }
 
     static QString internalWholeGroupId(const QMimeData *mime)
@@ -193,16 +240,70 @@ public:
         return payload.left(separator);
     }
 
+    static bool isImportableUrl(const QUrl &url)
+    {
+        if (!url.isValid())
+            return false;
+        if (url.isLocalFile())
+            return QFileInfo(url.toLocalFile()).isAbsolute();
+        if (url.isRelative() || url.scheme().isEmpty())
+            return false;
+        if (!url.host().isEmpty())
+            return true;
+
+        // Opaque URLs such as mailto:, magnet:, urn:, and custom app links do
+        // not have a host. They still cannot contain unescaped whitespace.
+        // This distinction is important for browser drags: Qt permissively
+        // parses page titles such as "Video: Funny Cats - YouTube" as a URL
+        // with the invented scheme "video".
+        const QString display = url.toDisplayString();
+        const qsizetype separator = display.indexOf(QLatin1Char(':'));
+        if (separator < 1 || separator == display.size() - 1)
+            return false;
+        const QString payload = display.sliced(separator + 1);
+        return std::none_of(payload.cbegin(), payload.cend(),
+            [](QChar character) { return character.isSpace(); });
+    }
+
+    static QList<QUrl> sanitizedUrls(const QList<QUrl> &offeredUrls, QString *companionTitle = nullptr)
+    {
+        QList<QUrl> urls;
+        QString title;
+        for (const auto &url : offeredUrls) {
+            if (isImportableUrl(url)) {
+                if (!urls.contains(url))
+                    urls.append(url);
+                continue;
+            }
+            const QString candidate = url.toDisplayString().trimmed();
+            if (title.isEmpty() && !candidate.isEmpty() && !candidate.contains(QLatin1Char('\n')))
+                title = candidate;
+        }
+        if (companionTitle)
+            *companionTitle = title;
+        return urls;
+    }
+
     bool add(const QMimeData *mime)
     {
         if (!canImport(mime))
             return false;
+        if ((mime->hasText() && mime->text().toUtf8().size() > kMaxOwnedPayloadBytes)
+            || (mime->hasHtml() && mime->html().toUtf8().size() > kMaxOwnedPayloadBytes)) {
+            return false;
+        }
 
         ShelfGroup group;
         group.id = QUuid::createUuid().toString(QUuid::WithoutBraces);
 
-        if (mime->hasUrls()) {
-            for (const auto &url : mime->urls()) {
+        const QImage offeredImage = imageFromMime(mime);
+        QString companionTitle;
+        const QList<QUrl> offeredUrls = offeredImage.isNull() && mime->hasUrls()
+            ? sanitizedUrls(mime->urls(), &companionTitle)
+            : QList<QUrl>();
+
+        if (!offeredUrls.isEmpty()) {
+            for (const auto &url : offeredUrls) {
                 ShelfItem item;
                 item.id = QUuid::createUuid().toString(QUuid::WithoutBraces);
                 if (url.isLocalFile()) {
@@ -210,6 +311,15 @@ public:
                     item.kind = info.isDir() ? QStringLiteral("folder") : QStringLiteral("file");
                     item.title = info.fileName().isEmpty() ? info.absoluteFilePath() : info.fileName();
                     item.value = info.absoluteFilePath();
+                    if (info.isFile() && isEphemeralPath(item.value)) {
+                        QString ownedPath;
+                        if (!materializeFile(info, item.id, &ownedPath)) {
+                            removeOwned(group);
+                            return false;
+                        }
+                        item.value = ownedPath;
+                        item.owned = true;
+                    }
                 } else {
                     item.kind = QStringLiteral("url");
                     item.title = url.fileName().isEmpty() ? url.host() : url.fileName();
@@ -218,36 +328,60 @@ public:
                 }
                 group.items.append(item);
             }
-        } else if (mime->hasImage()) {
-            QImage image = qvariant_cast<QImage>(mime->imageData());
-            if (image.isNull()) {
-                const QPixmap pixmap = qvariant_cast<QPixmap>(mime->imageData());
-                image = pixmap.toImage();
+            if (group.items.size() == 1 && group.items.first().kind == QLatin1String("url")
+                && !companionTitle.isEmpty()) {
+                group.items.first().title = compactText(companionTitle);
             }
-            if (image.isNull())
+            if (group.items.size() == 1
+                && group.items.first().kind == QLatin1String("url")) {
+                auto &item = group.items.first();
+                if (mime->hasText())
+                    item.plainText = mime->text();
+                if (mime->hasHtml())
+                    item.html = mime->html();
+            }
+        } else if (!offeredImage.isNull()) {
+            QByteArray pngPayload;
+            QBuffer buffer(&pngPayload);
+            if (!buffer.open(QIODevice::WriteOnly) || !offeredImage.save(&buffer, "PNG")
+                || pngPayload.size() > kMaxOwnedPayloadBytes) {
                 return false;
+            }
             const QString fileName = group.id + QStringLiteral(".png");
             const QString path = m_content + QLatin1Char('/') + fileName;
             QSaveFile file(path);
             if (!file.open(QIODevice::WriteOnly))
                 return false;
-            if (!image.save(&file, "PNG") || !file.commit())
+            file.setPermissions(QFileDevice::ReadOwner | QFileDevice::WriteOwner);
+            if (file.write(pngPayload) != pngPayload.size() || !file.commit())
                 return false;
             ShelfItem item;
             item.id = QUuid::createUuid().toString(QUuid::WithoutBraces);
             item.kind = QStringLiteral("image");
-            item.title = QStringLiteral("Screenshot %1 × %2").arg(image.width()).arg(image.height());
+            item.title = QStringLiteral("Screenshot %1 × %2")
+                .arg(offeredImage.width()).arg(offeredImage.height());
             item.value = path;
             item.owned = true;
+            if (mime->hasText())
+                item.plainText = mime->text();
+            if (mime->hasHtml())
+                item.html = mime->html();
             group.items.append(item);
-        } else {
+        } else if (mime->hasHtml() || mime->hasText()) {
             ShelfItem item;
             item.id = QUuid::createUuid().toString(QUuid::WithoutBraces);
             item.kind = mime->hasHtml() ? QStringLiteral("html") : QStringLiteral("text");
             item.plainText = mime->text();
             item.html = mime->hasHtml() ? mime->html() : QString();
+            if (item.plainText.isEmpty() && !item.html.isEmpty()) {
+                QTextDocument document;
+                document.setHtml(item.html);
+                item.plainText = document.toPlainText();
+            }
             item.title = compactText(item.plainText.isEmpty() ? QStringLiteral("Rich text") : item.plainText);
             group.items.append(item);
+        } else {
+            return false;
         }
 
         if (group.items.isEmpty())
@@ -256,18 +390,28 @@ public:
             ? group.items.first().title
             : QStringLiteral("%1 items").arg(group.items.size());
         m_groups.prepend(group);
-        return save();
+        if (save())
+            return true;
+        m_groups.removeFirst();
+        removeOwned(group);
+        return false;
     }
 
-    void setPinned(const QString &id, bool pinned)
+    bool setPinned(const QString &id, bool pinned)
     {
         for (auto &group : m_groups) {
             if (group.id == id) {
+                if (group.pinned == pinned)
+                    return true;
+                const bool previous = group.pinned;
                 group.pinned = pinned;
-                save();
-                return;
+                if (save())
+                    return true;
+                group.pinned = previous;
+                return false;
             }
         }
+        return false;
     }
 
     bool updateText(const QString &id, const QString &text)
@@ -329,9 +473,13 @@ public:
         for (qsizetype index = 0; index < m_groups.size(); ++index) {
             if (m_groups[index].id != id)
                 continue;
-            removeOwned(m_groups[index]);
-            m_groups.removeAt(index);
-            return save();
+            const ShelfGroup removed = m_groups.takeAt(index);
+            if (!save()) {
+                m_groups.insert(index, removed);
+                return false;
+            }
+            removeOwned(removed);
+            return true;
         }
         return false;
     }
@@ -347,23 +495,34 @@ public:
                     continue;
                 if (group.items.size() == 1)
                     return remove(groupId);
-                const auto removed = group.items[itemIndex];
-                if (removed.owned && !removed.value.isEmpty())
-                    QFile::remove(removed.value);
+                const ShelfGroup original = group;
+                const ShelfItem removed = group.items[itemIndex];
                 group.items.removeAt(itemIndex);
-                group.title = QStringLiteral("%1 items").arg(group.items.size());
-                return save();
+                group.title = group.items.size() == 1
+                    ? group.items.first().title
+                    : QStringLiteral("%1 items").arg(group.items.size());
+                if (!save()) {
+                    group = original;
+                    return false;
+                }
+                removeOwned(removed);
+                return true;
             }
         }
         return false;
     }
 
-    void clear()
+    bool clear()
     {
-        for (const auto &group : std::as_const(m_groups))
-            removeOwned(group);
+        const auto removed = m_groups;
         m_groups.clear();
-        save();
+        if (!save()) {
+            m_groups = removed;
+            return false;
+        }
+        for (const auto &group : removed)
+            removeOwned(group);
+        return true;
     }
 
     std::unique_ptr<QMimeData> mimeFor(const QString &id, const QString &itemId = {}) const
@@ -375,24 +534,63 @@ public:
         mime->setData(kInternalMime, (id + QLatin1Char('/') + itemId).toUtf8());
 
         QList<QUrl> urls;
+        bool hasPayload = false;
         for (const auto &item : entry->items) {
             if (!itemId.isEmpty() && item.id != itemId)
                 continue;
-            if (item.kind == QLatin1String("file") || item.kind == QLatin1String("folder"))
-                urls.append(QUrl::fromLocalFile(item.value));
-            else if (item.kind == QLatin1String("url"))
-                urls.append(QUrl(item.value));
+            if (item.kind == QLatin1String("file") || item.kind == QLatin1String("folder")) {
+                if (QFileInfo::exists(item.value)) {
+                    urls.append(QUrl::fromLocalFile(item.value));
+                    hasPayload = true;
+                }
+            } else if (item.kind == QLatin1String("url")) {
+                const QUrl url(item.value);
+                if (isImportableUrl(url)) {
+                    urls.append(url);
+                    hasPayload = true;
+                }
+            }
             else if (item.kind == QLatin1String("image")) {
                 QImageReader reader(item.value);
                 const QImage image = reader.read();
-                if (!image.isNull()) mime->setImageData(image);
-                urls.append(QUrl::fromLocalFile(item.value));
+                if (!image.isNull()) {
+                    mime->setImageData(image);
+                    urls.append(QUrl::fromLocalFile(item.value));
+                    hasPayload = true;
+                }
             } else {
-                if (!item.plainText.isEmpty()) mime->setText(item.plainText);
-                if (!item.html.isEmpty()) mime->setHtml(item.html);
+                if (!item.plainText.isEmpty()) {
+                    mime->setText(item.plainText);
+                    hasPayload = true;
+                }
+                if (!item.html.isEmpty()) {
+                    mime->setHtml(item.html);
+                    hasPayload = true;
+                }
+            }
+            if (item.kind != QLatin1String("text") && item.kind != QLatin1String("html")) {
+                if (!item.plainText.isEmpty()) {
+                    mime->setText(item.plainText);
+                    hasPayload = true;
+                }
+                if (!item.html.isEmpty()) {
+                    mime->setHtml(item.html);
+                    hasPayload = true;
+                }
             }
         }
-        if (!urls.isEmpty()) mime->setUrls(urls);
+        if (!urls.isEmpty())
+            mime->setUrls(urls);
+        if (!hasPayload)
+            return {};
+        return mime;
+    }
+
+    std::unique_ptr<QMimeData> clipboardMimeFor(const QString &id, const QString &itemId = {}) const
+    {
+        auto mime = mimeFor(id, itemId);
+        if (mime)
+            mime->removeFormat(QString::fromLatin1(kInternalMime));
         return mime;
     }
 
@@ -433,44 +631,187 @@ public:
     }
 
 private:
+    static bool pathWithin(const QString &path, const QString &root)
+    {
+        if (path.isEmpty() || root.isEmpty())
+            return false;
+        const QString cleanPath = QDir::cleanPath(path);
+        const QString cleanRoot = QDir::cleanPath(root);
+        return cleanPath == cleanRoot
+            || cleanPath.startsWith(cleanRoot + QDir::separator());
+    }
+
+    bool isEphemeralPath(const QString &path) const
+    {
+        const QString canonicalPath = QFileInfo(path).canonicalFilePath();
+        if (canonicalPath.isEmpty())
+            return false;
+        const QString ownRoot = QFileInfo(m_root).canonicalFilePath();
+        if (pathWithin(canonicalPath, ownRoot))
+            return false;
+
+        QStringList ephemeralRoots = {QFileInfo(QDir::tempPath()).canonicalFilePath()};
+        const QString runtimeRoot = QStandardPaths::writableLocation(
+            QStandardPaths::RuntimeLocation);
+        if (!runtimeRoot.isEmpty())
+            ephemeralRoots.append(QFileInfo(runtimeRoot).canonicalFilePath());
+        return std::any_of(ephemeralRoots.cbegin(), ephemeralRoots.cend(),
+            [&canonicalPath](const QString &root) { return pathWithin(canonicalPath, root); });
+    }
+
+    bool materializeFile(const QFileInfo &sourceInfo, const QString &itemId,
+        QString *ownedPath) const
+    {
+        if (!ownedPath || sourceInfo.size() < 0
+            || sourceInfo.size() > kMaxOwnedPayloadBytes) {
+            return false;
+        }
+        QFile source(sourceInfo.absoluteFilePath());
+        if (!source.open(QIODevice::ReadOnly))
+            return false;
+
+        const QString safeName = sourceInfo.fileName().isEmpty()
+            ? QStringLiteral("payload") : sourceInfo.fileName();
+        const QString destination = m_content + QLatin1Char('/') + itemId
+            + QLatin1Char('-') + safeName;
+        QSaveFile output(destination);
+        if (!output.open(QIODevice::WriteOnly))
+            return false;
+        output.setPermissions(QFileDevice::ReadOwner | QFileDevice::WriteOwner);
+        constexpr qint64 chunkSize = 1024 * 1024;
+        qint64 copiedBytes = 0;
+        while (!source.atEnd()) {
+            const QByteArray chunk = source.read(chunkSize);
+            if (chunk.isEmpty() && source.error() != QFileDevice::NoError)
+                return false;
+            copiedBytes += chunk.size();
+            if (copiedBytes > kMaxOwnedPayloadBytes)
+                return false;
+            if (output.write(chunk) != chunk.size())
+                return false;
+        }
+        if (!output.commit())
+            return false;
+        *ownedPath = destination;
+        return true;
+    }
+
     void load()
     {
         QFile file(m_statePath);
         if (!file.open(QIODevice::ReadOnly))
             return;
-        const auto document = QJsonDocument::fromJson(file.readAll());
+        QJsonParseError parseError;
+        const auto document = QJsonDocument::fromJson(file.readAll(), &parseError);
+        if (parseError.error != QJsonParseError::NoError || !document.isObject()
+            || document.object().value(QStringLiteral("version")).toInt(-1) != 1) {
+            m_storageWritable = false;
+            qWarning("PasteShelf Native left an invalid or unsupported state file untouched.");
+            return;
+        }
+        bool normalizedLegacyUrls = false;
         for (const auto &value : document.object().value(QStringLiteral("groups")).toArray()) {
             auto group = ShelfGroup::fromJson(value.toObject());
+            normalizedLegacyUrls = normalizeLegacyUrlGroup(group) || normalizedLegacyUrls;
             if (!group.id.isEmpty() && !group.items.isEmpty())
                 m_groups.append(std::move(group));
+        }
+        if (normalizedLegacyUrls)
+            save();
+    }
+
+    void cleanupOrphans() const
+    {
+        QSet<QString> referenced;
+        for (const auto &group : m_groups) {
+            for (const auto &item : group.items) {
+                if (item.owned && isOwnedPayloadPath(item.value))
+                    referenced.insert(QFileInfo(item.value).absoluteFilePath());
+            }
+        }
+        const QFileInfoList contentFiles = QDir(m_content).entryInfoList(
+            QDir::Files | QDir::NoDotAndDotDot | QDir::Hidden | QDir::System);
+        for (const QFileInfo &file : contentFiles) {
+            if (!referenced.contains(file.absoluteFilePath()))
+                QFile::remove(file.absoluteFilePath());
         }
     }
 
     bool save() const
     {
+        if (!m_storageWritable)
+            return false;
         QJsonArray array;
         for (const auto &group : m_groups)
             array.append(group.toJson());
         QSaveFile file(m_statePath);
         if (!file.open(QIODevice::WriteOnly))
             return false;
-        file.write(QJsonDocument(QJsonObject{{QStringLiteral("version"), 1},
-                                             {QStringLiteral("groups"), array}}).toJson(QJsonDocument::Compact));
+        file.setPermissions(QFileDevice::ReadOwner | QFileDevice::WriteOwner);
+        const QByteArray payload = QJsonDocument(QJsonObject{
+            {QStringLiteral("version"), 1},
+            {QStringLiteral("groups"), array},
+        }).toJson(QJsonDocument::Compact);
+        if (file.write(payload) != payload.size())
+            return false;
         return file.commit();
     }
 
-    static void removeOwned(const ShelfGroup &group)
+    bool isOwnedPayloadPath(const QString &path) const
+    {
+        if (path.isEmpty())
+            return false;
+        const QFileInfo candidate(path);
+        return candidate.isAbsolute()
+            && candidate.absolutePath() == QDir(m_content).absolutePath();
+    }
+
+    void removeOwned(const ShelfItem &item) const
+    {
+        if (item.owned && isOwnedPayloadPath(item.value))
+            QFile::remove(item.value);
+    }
+
+    void removeOwned(const ShelfGroup &group) const
     {
         for (const auto &item : group.items) {
-            if (item.owned && !item.value.isEmpty())
-                QFile::remove(item.value);
+            removeOwned(item);
         }
+    }
+
+    static bool normalizeLegacyUrlGroup(ShelfGroup &group)
+    {
+        if (group.items.size() < 2)
+            return false;
+        QList<ShelfItem> validItems;
+        QString companionTitle;
+        for (const auto &item : std::as_const(group.items)) {
+            if (item.kind != QLatin1String("url"))
+                return false;
+            if (isImportableUrl(QUrl(item.value))) {
+                validItems.append(item);
+            } else if (companionTitle.isEmpty()) {
+                companionTitle = item.value.trimmed();
+            }
+        }
+        if (validItems.isEmpty() || validItems.size() == group.items.size())
+            return false;
+        group.items = std::move(validItems);
+        if (group.items.size() == 1) {
+            if (!companionTitle.isEmpty())
+                group.items.first().title = compactText(companionTitle);
+            group.title = group.items.first().title;
+        } else {
+            group.title = QStringLiteral("%1 items").arg(group.items.size());
+        }
+        return true;
     }
 
     QString m_root;
     QString m_content;
     QString m_statePath;
     QList<ShelfGroup> m_groups;
+    bool m_storageWritable = true;
 };
 
 bool isLocalItem(const ShelfItem &item)
@@ -653,6 +994,13 @@ public:
             connect(source, &QToolButton::clicked, this, [this] { goToSource(m_item); });
             layout->addWidget(source);
         }
+        auto *copy = actionButton(QStringLiteral("edit-copy"), QStringLiteral("C"),
+            QStringLiteral("Copy this item"));
+        copy->setObjectName(QStringLiteral("memberCopyButton"));
+        connect(copy, &QToolButton::clicked, this, [this] {
+            emit copyRequested(m_groupId, m_item.id);
+        });
+        layout->addWidget(copy);
         auto *remove = actionButton(QStringLiteral("edit-delete"), QStringLiteral("×"), QStringLiteral("Remove this item"));
         connect(remove, &QToolButton::clicked, this, [this] { poof(); });
         layout->addWidget(remove);
@@ -660,6 +1008,7 @@ public:
 
 signals:
     void removeRequested(const QString &groupId, const QString &itemId);
+    void copyRequested(const QString &groupId, const QString &itemId);
     void dragActiveChanged(bool active);
 
 protected:
@@ -694,6 +1043,7 @@ protected:
         emit dragActiveChanged(true);
         const auto action = drag->exec(Qt::CopyAction, Qt::CopyAction);
         emit dragActiveChanged(false);
+        drag->deleteLater();
         setCursor(Qt::OpenHandCursor);
         if (action == Qt::CopyAction && !m_isPinned())
             poof();
@@ -847,6 +1197,14 @@ public:
             actionLayout->addWidget(source);
         }
 
+        auto *copyButton = actionButton(m_actionStrip, QStringLiteral("edit-copy"), QStringLiteral("C"),
+            QStringLiteral("Copy to clipboard"));
+        copyButton->setObjectName(QStringLiteral("copyButton"));
+        connect(copyButton, &QToolButton::clicked, this, [this] {
+            emit copyRequested(m_group.id, {});
+        });
+        actionLayout->addWidget(copyButton);
+
         m_pinButton = actionButton(m_actionStrip, QStringLiteral("window-pin"), QStringLiteral("P"), QString());
         m_pinButton->setObjectName(QStringLiteral("pinButton"));
         connect(m_pinButton, &QToolButton::clicked, this, [this] {
@@ -896,6 +1254,17 @@ public:
         setExpanded(true);
     }
 
+    void setExpandedForTest(bool expanded)
+    {
+        setExpanded(expanded);
+    }
+
+    bool detailsExpandedForTest() const
+    {
+        return m_expanded && m_details && !m_details->isHidden()
+            && m_details->maximumHeight() == m_detailsExpandedHeight;
+    }
+
     void savePreviewForTest(const QString &path)
     {
         if (!m_previewPopup)
@@ -914,6 +1283,7 @@ public:
 
 signals:
     void pinChanged(const QString &id, bool pinned);
+    void copyRequested(const QString &groupId, const QString &itemId);
     void removeRequested(const QString &id);
     void removeItemRequested(const QString &groupId, const QString &itemId);
     void dragActiveChanged(bool active);
@@ -1012,6 +1382,7 @@ protected:
         emit dragActiveChanged(true);
         const auto action = drag->exec(Qt::CopyAction, Qt::CopyAction);
         emit dragActiveChanged(false);
+        drag->deleteLater();
         setCursor(Qt::OpenHandCursor);
         if (action == Qt::CopyAction && !m_internalReorderAccepted && !m_pinned)
             poof(true);
@@ -1092,6 +1463,7 @@ private:
         if (m_group.items.size() > 1) {
             for (const auto &item : m_group.items) {
                 auto *row = new MemberRow(m_group.id, item, m_store, [this] { return m_pinned; }, m_details);
+                connect(row, &MemberRow::copyRequested, this, &CardWidget::copyRequested);
                 connect(row, &MemberRow::removeRequested, this, &CardWidget::removeItemRequested);
                 connect(row, &MemberRow::dragActiveChanged, this, &CardWidget::dragActiveChanged);
                 layout->addWidget(row);
@@ -1182,6 +1554,12 @@ private:
     {
         if (!m_expandable || m_expanded == expanded)
             return;
+        if (m_detailsAnimation) {
+            auto *previous = m_detailsAnimation.data();
+            m_detailsAnimation.clear();
+            previous->stop();
+            previous->deleteLater();
+        }
         m_expanded = expanded;
         m_showPreviewTimer.stop();
         if (m_previewPopup) m_previewPopup->hide();
@@ -1192,10 +1570,16 @@ private:
         animation->setStartValue(m_details->maximumHeight());
         animation->setEndValue(target);
         animation->setEasingCurve(QEasingCurve::OutCubic);
-        if (!expanded) {
-            connect(animation, &QPropertyAnimation::finished, m_details, &QWidget::hide);
-        }
-        animation->start(QAbstractAnimation::DeleteWhenStopped);
+        m_detailsAnimation = animation;
+        connect(animation, &QPropertyAnimation::finished, this, [this, animation, expanded] {
+            if (m_detailsAnimation != animation)
+                return;
+            m_detailsAnimation.clear();
+            if (!expanded)
+                m_details->hide();
+            animation->deleteLater();
+        });
+        animation->start();
     }
 
     void poof(bool draggedOut)
@@ -1233,6 +1617,7 @@ private:
     QFrame *m_details = nullptr;
     int m_detailsExpandedHeight = 0;
     QPointer<HoverPreview> m_previewPopup;
+    QPointer<QPropertyAnimation> m_detailsAnimation;
     QTimer m_showPreviewTimer;
     QTimer m_hidePreviewTimer;
     QTimer m_singleClickTimer;
@@ -1502,6 +1887,15 @@ public:
     ~ShelfWindow() override
     {
         qApp->removeEventFilter(this);
+        // QObject disconnects receivers during its base destructor, but that
+        // happens after ShelfWindow's members have already been destroyed.
+        // Disconnect widget-destruction callbacks while both tracking sets
+        // are still alive, including callbacks for children that are no
+        // longer currently hovered.
+        for (auto *widget : std::as_const(m_hoverTrackedWidgets))
+            QObject::disconnect(widget, nullptr, this, nullptr);
+        m_hoverTrackedWidgets.clear();
+        m_hoveredWidgets.clear();
         delete m_handle;
     }
 
@@ -1536,6 +1930,10 @@ public:
     }
     bool addTextNoteForTest(const QString &text) { return addTextNote(text); }
     bool editTextNoteForTest(const QString &id, const QString &text) { return editTextNote(id, text); }
+    bool copyToClipboardForTest(const QString &groupId, const QString &itemId = {})
+    {
+        return copyToClipboard(groupId, itemId);
+    }
     bool firstPreviewAlignedForTest() const
     {
         auto *card = findChild<CardWidget *>();
@@ -1724,7 +2122,9 @@ protected:
             if (event->type() == QEvent::Enter) {
                 if (!widget->property("pasteshelfHoverTracked").toBool()) {
                     widget->setProperty("pasteshelfHoverTracked", true);
+                    m_hoverTrackedWidgets.insert(widget);
                     connect(widget, &QObject::destroyed, this, [this, widget] {
+                        m_hoverTrackedWidgets.remove(widget);
                         m_hoveredWidgets.remove(widget);
                         scheduleCloseAfterPointerLeave();
                     });
@@ -2309,17 +2709,26 @@ private:
             auto *card = new CardWidget(group, m_store, m_cardsHost,
                 [this](const QWidget *widget) { return authoritativeGlobalRect(widget); });
             connect(card, &CardWidget::pinChanged, this, [this](const QString &id, bool pinned) {
-                m_store->setPinned(id, pinned);
+                if (!m_store->setPinned(id, pinned)) {
+                    rebuildCards();
+                    showTransientHint(QStringLiteral("Could not save pin state"), 1500);
+                }
             });
+            connect(card, &CardWidget::copyRequested, this,
+                [this](const QString &groupId, const QString &itemId) {
+                    copyToClipboard(groupId, itemId);
+                });
             connect(card, &CardWidget::editTextRequested,
                 this, &ShelfWindow::showEditTextDialog);
             connect(card, &CardWidget::removeRequested, this, [this](const QString &id) {
-                m_store->remove(id);
+                if (!m_store->remove(id))
+                    showTransientHint(QStringLiteral("Could not remove item"), 1500);
                 rebuildCards();
             });
             connect(card, &CardWidget::removeItemRequested, this,
                 [this](const QString &groupId, const QString &itemId) {
-                    m_store->removeItem(groupId, itemId);
+                    if (!m_store->removeItem(groupId, itemId))
+                        showTransientHint(QStringLiteral("Could not remove stack item"), 1500);
                     rebuildCards();
                 });
             connect(card, &CardWidget::dragActiveChanged, this, [this](bool active) {
@@ -2606,8 +3015,11 @@ private:
         confirmation.exec();
         if (confirmation.clickedButton() != clearButton)
             return;
-        m_store->clear();
-        rebuildCards();
+        if (m_store->clear()) {
+            rebuildCards();
+        } else {
+            showTransientHint(QStringLiteral("Could not clear the shelf"), 1500);
+        }
     }
 
     void addClipboardContent()
@@ -2622,6 +3034,21 @@ private:
             openShelf();
             showTransientHint(QStringLiteral("✓  Added from clipboard"), 1200);
         }
+    }
+
+    bool copyToClipboard(const QString &groupId, const QString &itemId = {})
+    {
+        auto mime = m_store->clipboardMimeFor(groupId, itemId);
+        if (!mime) {
+            showTransientHint(QStringLiteral("Could not copy item"), 1500);
+            return false;
+        }
+        QApplication::clipboard()->setMimeData(mime.release(), QClipboard::Clipboard);
+        showTransientHint(itemId.isEmpty()
+                ? QStringLiteral("✓  Copied to clipboard")
+                : QStringLiteral("✓  Item copied to clipboard"),
+            1200);
+        return true;
     }
 
     bool addTextNote(const QString &text)
@@ -2719,7 +3146,7 @@ private:
             return;
         m_tray = new QSystemTrayIcon(windowIcon(), this);
         m_tray->setToolTip(QStringLiteral("PasteShelf Native (optimized test build)"));
-        auto *menu = new QMenu;
+        auto *menu = new QMenu(this);
         QAction *newText = menu->addAction(QStringLiteral("New text note…"));
         connect(newText, &QAction::triggered, this, &ShelfWindow::showNewTextNoteDialog);
         QAction *clipboard = menu->addAction(QStringLiteral("Add clipboard"));
@@ -2758,6 +3185,7 @@ private:
     QPointer<QVariantAnimation> m_animation;
     QPointer<QVariantAnimation> m_handleFillAnimation;
     QSet<QWidget *> m_hoveredWidgets;
+    QSet<QWidget *> m_hoverTrackedWidgets;
     QTimer m_closeTimer;
     QTimer m_drainDelayTimer;
     QTimer m_hoverOpenTimer;
@@ -2866,15 +3294,41 @@ bool runSelfTest()
         if (!store.add(&mime) || store.groups().size() != 1)
             return false;
         textGroupId = store.groups().first().id;
+        const auto publicPermissionBits = QFileDevice::ReadGroup | QFileDevice::WriteGroup
+            | QFileDevice::ExeGroup | QFileDevice::ReadOther | QFileDevice::WriteOther
+            | QFileDevice::ExeOther;
+        if ((QFileInfo(directory.path() + QStringLiteral("/state.json")).permissions()
+                & publicPermissionBits) != QFileDevice::Permissions{}) {
+            return false;
+        }
         const auto output = store.mimeFor(textGroupId);
         if (!output || output->text() != mime.text() || output->html() != mime.html())
             return false;
-        store.setPinned(textGroupId, true);
+        const auto clipboardOutput = store.clipboardMimeFor(textGroupId);
+        if (!clipboardOutput || clipboardOutput->text() != mime.text()
+            || clipboardOutput->html() != mime.html()
+            || clipboardOutput->hasFormat(QString::fromLatin1(kInternalMime))) {
+            return false;
+        }
+        if (!store.setPinned(textGroupId, true))
+            return false;
         if (!store.updateText(textGroupId, QStringLiteral("Edited copied text")))
             return false;
         const auto editedOutput = store.mimeFor(textGroupId);
         if (!editedOutput || editedOutput->text() != QStringLiteral("Edited copied text")
             || editedOutput->hasHtml() || !store.group(textGroupId)->pinned) {
+            return false;
+        }
+
+        QMimeData htmlOnly;
+        htmlOnly.setHtml(QStringLiteral("<p>HTML <b>only</b></p>"));
+        if (!store.add(&htmlOnly))
+            return false;
+        const QString htmlOnlyGroupId = store.groups().first().id;
+        const auto htmlOnlyOutput = store.mimeFor(htmlOnlyGroupId);
+        if (!htmlOnlyOutput || htmlOnlyOutput->text() != QStringLiteral("HTML only")
+            || htmlOnlyOutput->html() != htmlOnly.html()
+            || !store.remove(htmlOnlyGroupId)) {
             return false;
         }
 
@@ -2899,13 +3353,63 @@ bool runSelfTest()
         if (!memberOutput || memberOutput->urls().size() != 1
             || memberOutput->urls().first().toLocalFile() != secondPath)
             return false;
+        CardWidget stackCard(*store.group(fileGroupId), &store);
+        stackCard.setFixedWidth(370);
+        stackCard.expandForTest();
+        bool memberCopySignalReceived = false;
+        QString copiedMemberGroupId;
+        QString copiedMemberItemId;
+        QObject::connect(&stackCard, &CardWidget::copyRequested,
+            [&memberCopySignalReceived, &copiedMemberGroupId, &copiedMemberItemId](
+                const QString &groupId, const QString &itemId) {
+                memberCopySignalReceived = true;
+                copiedMemberGroupId = groupId;
+                copiedMemberItemId = itemId;
+            });
+        const auto memberCopyButtons = stackCard.findChildren<QToolButton *>(
+            QStringLiteral("memberCopyButton"));
+        if (memberCopyButtons.size() != 2)
+            return false;
+        memberCopyButtons.last()->click();
+        if (!memberCopySignalReceived || copiedMemberGroupId != fileGroupId
+            || copiedMemberItemId != secondItemId) {
+            return false;
+        }
+        stackCard.show();
+        QApplication::processEvents();
+        stackCard.setExpandedForTest(false);
+        stackCard.setExpandedForTest(true);
+        stackCard.setExpandedForTest(false);
+        stackCard.setExpandedForTest(true);
+        QEventLoop detailsAnimationWait;
+        QTimer::singleShot(220, &detailsAnimationWait, &QEventLoop::quit);
+        detailsAnimationWait.exec();
+        if (!stackCard.detailsExpandedForTest())
+            return false;
         if (!store.removeItem(fileGroupId, firstItemId)
             || store.groups().first().items.size() != 1
-            || store.groups().first().items.first().id != secondItemId)
+            || store.groups().first().items.first().id != secondItemId
+            || store.groups().first().title != QStringLiteral("source-two.txt"))
             return false;
         store.remove(fileGroupId);
         if (!QFileInfo::exists(firstPath) || !QFileInfo::exists(secondPath))
             return false;
+
+        const QString vanishingPath = directory.path() + QStringLiteral("/vanishing.txt");
+        QFile vanishingFile(vanishingPath);
+        if (!vanishingFile.open(QIODevice::WriteOnly) || vanishingFile.write("gone") != 4)
+            return false;
+        vanishingFile.close();
+        QMimeData vanishingMime;
+        vanishingMime.setUrls({QUrl::fromLocalFile(vanishingPath)});
+        if (!store.add(&vanishingMime))
+            return false;
+        const QString vanishingGroupId = store.groups().first().id;
+        if (!QFile::remove(vanishingPath) || store.mimeFor(vanishingGroupId)
+            || store.clipboardMimeFor(vanishingGroupId)
+            || !store.remove(vanishingGroupId)) {
+            return false;
+        }
 
         QImage image(640, 480, QImage::Format_ARGB32_Premultiplied);
         image.fill(QColor(QStringLiteral("#e7c844")));
@@ -2921,6 +3425,32 @@ bool runSelfTest()
         if (QFileInfo::exists(ownedImagePath))
             return false;
 
+        QByteArray encodedImage;
+        QBuffer encodedImageBuffer(&encodedImage);
+        if (!encodedImageBuffer.open(QIODevice::WriteOnly)
+            || !image.save(&encodedImageBuffer, "PNG")) {
+            return false;
+        }
+        QMimeData rawImageMime;
+        rawImageMime.setData(QStringLiteral("image/png"), encodedImage);
+        rawImageMime.setUrls({QUrl(QStringLiteral("https://example.com/incidental-image-link"))});
+        if (!ShelfStore::canImport(&rawImageMime) || !store.add(&rawImageMime)
+            || store.groups().first().items.size() != 1
+            || store.groups().first().items.first().kind != QLatin1String("image")) {
+            return false;
+        }
+        const QString rawImageGroupId = store.groups().first().id;
+        const QString rawImagePath = store.groups().first().items.first().value;
+        if (!store.remove(rawImageGroupId) || QFileInfo::exists(rawImagePath))
+            return false;
+
+        QMimeData invalidImageMime;
+        invalidImageMime.setData(QStringLiteral("image/png"), QByteArrayLiteral("not an image"));
+        if (!ShelfStore::canImport(&invalidImageMime) || store.add(&invalidImageMime)
+            || store.groups().size() != 1) {
+            return false;
+        }
+
         QMimeData internal;
         internal.setText(QStringLiteral("must not clone"));
         internal.setData(kInternalMime, QByteArrayLiteral("internal"));
@@ -2934,6 +3464,58 @@ bool runSelfTest()
         || reloaded.groups().first().items.first().plainText != QStringLiteral("Edited copied text")
         || reloaded.groups().first().items.first().kind != QLatin1String("text")) {
         return false;
+    }
+
+    QTemporaryDir ephemeralSourceDirectory;
+    QTemporaryDir ephemeralStoreDirectory;
+    if (!ephemeralSourceDirectory.isValid() || !ephemeralStoreDirectory.isValid())
+        return false;
+    {
+        ShelfStore ephemeralStore(ephemeralStoreDirectory.path());
+        const QString temporaryPath = ephemeralSourceDirectory.path()
+            + QStringLiteral("/temporary-export.txt");
+        QFile temporarySource(temporaryPath);
+        if (!temporarySource.open(QIODevice::WriteOnly)
+            || temporarySource.write("survive restart") != 15) {
+            return false;
+        }
+        temporarySource.close();
+        QMimeData temporaryFileMime;
+        temporaryFileMime.setUrls({QUrl::fromLocalFile(temporaryPath)});
+        if (!ephemeralStore.add(&temporaryFileMime))
+            return false;
+        const ShelfGroup temporaryGroup = ephemeralStore.groups().first();
+        const QString materializedPath = temporaryGroup.items.first().value;
+        const auto ephemeralPublicPermissionBits = QFileDevice::ReadGroup
+            | QFileDevice::WriteGroup | QFileDevice::ExeGroup | QFileDevice::ReadOther
+            | QFileDevice::WriteOther | QFileDevice::ExeOther;
+        if (!temporaryGroup.items.first().owned || materializedPath == temporaryPath
+            || !QFileInfo::exists(materializedPath)
+            || (QFileInfo(materializedPath).permissions() & ephemeralPublicPermissionBits)
+                != QFileDevice::Permissions{}) {
+            return false;
+        }
+        if (!QFile::remove(temporaryPath))
+            return false;
+        const auto durableMime = ephemeralStore.mimeFor(temporaryGroup.id);
+        if (!durableMime || durableMime->urls().size() != 1
+            || durableMime->urls().first().toLocalFile() != materializedPath)
+            return false;
+        if (!ephemeralStore.remove(temporaryGroup.id) || QFileInfo::exists(materializedPath))
+            return false;
+
+        const QString oversizedPath = ephemeralSourceDirectory.path()
+            + QStringLiteral("/oversized-payload.bin");
+        QFile oversized(oversizedPath);
+        if (!oversized.open(QIODevice::WriteOnly)
+            || !oversized.resize(kMaxOwnedPayloadBytes + 1)) {
+            return false;
+        }
+        oversized.close();
+        QMimeData oversizedMime;
+        oversizedMime.setUrls({QUrl::fromLocalFile(oversizedPath)});
+        if (ephemeralStore.add(&oversizedMime) || !ephemeralStore.groups().isEmpty())
+            return false;
     }
 
     QTemporaryDir reorderDirectory;
@@ -2977,6 +3559,203 @@ bool runSelfTest()
         return false;
     }
 
+    QTemporaryDir browserUrlDirectory;
+    if (!browserUrlDirectory.isValid())
+        return false;
+    {
+        ShelfStore browserUrlStore(browserUrlDirectory.path());
+        if (ShelfStore::isImportableUrl(QUrl(QStringLiteral("Video: Funny Cats - YouTube")))
+            || ShelfStore::isImportableUrl(QUrl(QStringLiteral("C++: A Tour - YouTube")))
+            || ShelfStore::isImportableUrl(QUrl(QStringLiteral("File: quarterly report")))
+            || !ShelfStore::isImportableUrl(QUrl(QStringLiteral("mailto:person@example.com")))
+            || !ShelfStore::isImportableUrl(QUrl(QStringLiteral("custom://remote-host/item")))) {
+            return false;
+        }
+        QMimeData browserUrl;
+        browserUrl.setUrls({
+            QUrl(QStringLiteral("https://www.youtube.com/watch?v=example")),
+            QUrl(QStringLiteral("Video: Funny Cats - YouTube")),
+        });
+        browserUrl.setText(QStringLiteral("Funny Cats video"));
+        browserUrl.setHtml(QStringLiteral("<b>Funny Cats video</b>"));
+        if (!browserUrlStore.add(&browserUrl) || browserUrlStore.groups().first().items.size() != 1
+            || browserUrlStore.groups().first().items.first().value
+                != QStringLiteral("https://www.youtube.com/watch?v=example")
+            || browserUrlStore.groups().first().title != QStringLiteral("video: Funny Cats - YouTube")) {
+            return false;
+        }
+        const auto browserUrlOutput = browserUrlStore.mimeFor(
+            browserUrlStore.groups().first().id);
+        if (!browserUrlOutput || browserUrlOutput->urls().size() != 1
+            || browserUrlOutput->text() != browserUrl.text()
+            || browserUrlOutput->html() != browserUrl.html()) {
+            return false;
+        }
+
+        QMimeData genuineMultiUrl;
+        genuineMultiUrl.setUrls({
+            QUrl(QStringLiteral("https://example.com/one")),
+            QUrl(QStringLiteral("https://example.com/two")),
+        });
+        if (!browserUrlStore.add(&genuineMultiUrl)
+            || browserUrlStore.groups().first().items.size() != 2) {
+            return false;
+        }
+    }
+
+    QTemporaryDir legacyUrlDirectory;
+    if (!legacyUrlDirectory.isValid())
+        return false;
+    ShelfGroup malformedUrlGroup;
+    malformedUrlGroup.id = QStringLiteral("legacy-browser-url");
+    malformedUrlGroup.title = QStringLiteral("2 items");
+    malformedUrlGroup.items = {
+        {QStringLiteral("real-url"), QStringLiteral("url"), QStringLiteral("watch"),
+            QStringLiteral("https://www.youtube.com/watch?v=legacy"), {}, {}, false},
+        {QStringLiteral("browser-title"), QStringLiteral("url"), QStringLiteral("Video: Legacy video - YouTube"),
+            QStringLiteral("Video: Legacy video - YouTube"), {}, {}, false},
+    };
+    QSaveFile legacyState(legacyUrlDirectory.path() + QStringLiteral("/state.json"));
+    if (!legacyState.open(QIODevice::WriteOnly))
+        return false;
+    legacyState.write(QJsonDocument(QJsonObject{
+        {QStringLiteral("version"), 1},
+        {QStringLiteral("groups"), QJsonArray{malformedUrlGroup.toJson()}},
+    }).toJson(QJsonDocument::Compact));
+    if (!legacyState.commit())
+        return false;
+    ShelfStore migratedUrlStore(legacyUrlDirectory.path());
+    if (migratedUrlStore.groups().size() != 1
+        || migratedUrlStore.groups().first().items.size() != 1
+        || migratedUrlStore.groups().first().title != QStringLiteral("Video: Legacy video - YouTube")) {
+        return false;
+    }
+    ShelfStore persistedMigratedUrlStore(legacyUrlDirectory.path());
+    if (persistedMigratedUrlStore.groups().first().items.size() != 1)
+        return false;
+
+    QTemporaryDir failingStorageDirectory;
+    if (!failingStorageDirectory.isValid())
+        return false;
+    {
+        ShelfStore failingStore(failingStorageDirectory.path());
+        QImage image(32, 24, QImage::Format_ARGB32_Premultiplied);
+        image.fill(Qt::cyan);
+        QMimeData imageMime;
+        imageMime.setImageData(image);
+        if (!failingStore.add(&imageMime))
+            return false;
+        const QString originalId = failingStore.groups().first().id;
+        const QString originalImagePath = failingStore.groups().first().items.first().value;
+        const QString statePath = failingStorageDirectory.path() + QStringLiteral("/state.json");
+        if (!QFile::remove(statePath) || !QDir().mkdir(statePath))
+            return false;
+
+        if (failingStore.setPinned(originalId, true)
+            || failingStore.group(originalId)->pinned) {
+            return false;
+        }
+        QMimeData unsavedText;
+        unsavedText.setText(QStringLiteral("must roll back"));
+        if (failingStore.add(&unsavedText) || failingStore.groups().size() != 1)
+            return false;
+
+        const int ownedCountBeforeFailedAdd = QDir(
+            failingStorageDirectory.path() + QStringLiteral("/content"))
+            .entryList(QDir::Files).size();
+        QImage secondImage(20, 20, QImage::Format_ARGB32_Premultiplied);
+        secondImage.fill(Qt::magenta);
+        QMimeData unsavedImage;
+        unsavedImage.setImageData(secondImage);
+        if (failingStore.add(&unsavedImage)
+            || QDir(failingStorageDirectory.path() + QStringLiteral("/content"))
+                    .entryList(QDir::Files).size() != ownedCountBeforeFailedAdd) {
+            return false;
+        }
+        if (failingStore.remove(originalId) || failingStore.groups().size() != 1
+            || !QFileInfo::exists(originalImagePath)) {
+            return false;
+        }
+        if (failingStore.clear() || failingStore.groups().size() != 1
+            || !QFileInfo::exists(originalImagePath)) {
+            return false;
+        }
+    }
+
+    QTemporaryDir confinedCleanupDirectory;
+    if (!confinedCleanupDirectory.isValid())
+        return false;
+    const QString outsideOwnedPath = confinedCleanupDirectory.path()
+        + QStringLiteral("/must-not-delete.txt");
+    QFile outsideOwned(outsideOwnedPath);
+    if (!outsideOwned.open(QIODevice::WriteOnly) || outsideOwned.write("keep") != 4)
+        return false;
+    outsideOwned.close();
+    ShelfGroup unsafeOwnedGroup;
+    unsafeOwnedGroup.id = QStringLiteral("unsafe-owned-group");
+    unsafeOwnedGroup.title = QStringLiteral("Unsafe owned path");
+    unsafeOwnedGroup.items = {
+        {QStringLiteral("unsafe-owned-item"), QStringLiteral("image"),
+            QStringLiteral("Unsafe owned path"), outsideOwnedPath, {}, {}, true},
+    };
+    const QString confinedRoot = confinedCleanupDirectory.path() + QStringLiteral("/store");
+    QDir().mkpath(confinedRoot);
+    QSaveFile unsafeState(confinedRoot + QStringLiteral("/state.json"));
+    if (!unsafeState.open(QIODevice::WriteOnly))
+        return false;
+    unsafeState.write(QJsonDocument(QJsonObject{
+        {QStringLiteral("version"), 1},
+        {QStringLiteral("groups"), QJsonArray{unsafeOwnedGroup.toJson()}},
+    }).toJson(QJsonDocument::Compact));
+    if (!unsafeState.commit())
+        return false;
+    ShelfStore confinedStore(confinedRoot);
+    if (!confinedStore.remove(unsafeOwnedGroup.id) || !QFileInfo::exists(outsideOwnedPath))
+        return false;
+
+    QTemporaryDir orphanDirectory;
+    if (!orphanDirectory.isValid())
+        return false;
+    const QString orphanContent = orphanDirectory.path() + QStringLiteral("/content");
+    QDir().mkpath(orphanContent);
+    const QString orphanPath = orphanContent + QStringLiteral("/unfinished-payload");
+    QFile orphan(orphanPath);
+    if (!orphan.open(QIODevice::WriteOnly) || orphan.write("orphan") != 6)
+        return false;
+    orphan.close();
+    ShelfStore orphanCleaningStore(orphanDirectory.path());
+    if (QFileInfo::exists(orphanPath))
+        return false;
+
+    QTemporaryDir corruptStateDirectory;
+    if (!corruptStateDirectory.isValid())
+        return false;
+    const QString corruptStatePath = corruptStateDirectory.path() + QStringLiteral("/state.json");
+    const QByteArray corruptStateContents = QByteArrayLiteral("{not valid json");
+    QFile corruptState(corruptStatePath);
+    if (!corruptState.open(QIODevice::WriteOnly)
+        || corruptState.write(corruptStateContents) != corruptStateContents.size()) {
+        return false;
+    }
+    corruptState.close();
+    const QString preservedContent = corruptStateDirectory.path() + QStringLiteral("/content");
+    QDir().mkpath(preservedContent);
+    const QString preservedPayloadPath = preservedContent + QStringLiteral("/preserved-payload");
+    QFile preservedPayload(preservedPayloadPath);
+    if (!preservedPayload.open(QIODevice::WriteOnly) || preservedPayload.write("preserve") != 8)
+        return false;
+    preservedPayload.close();
+    ShelfStore corruptStore(corruptStateDirectory.path());
+    QMimeData refusedAfterCorruption;
+    refusedAfterCorruption.setText(QStringLiteral("do not overwrite the damaged state"));
+    if (corruptStore.add(&refusedAfterCorruption))
+        return false;
+    if (!QFileInfo::exists(preservedPayloadPath) || !corruptState.open(QIODevice::ReadOnly)
+        || corruptState.readAll() != corruptStateContents) {
+        return false;
+    }
+    corruptState.close();
+
     // Exercise the compact-card layout with deliberately hostile label widths.
     // This guards against a regression where QLabel's minimum size pushed the
     // pin and remove controls outside the right edge of the card.
@@ -2988,6 +3767,7 @@ bool runSelfTest()
     card.show();
     QApplication::processEvents();
     auto *pinButton = card.findChild<QToolButton *>(QStringLiteral("pinButton"));
+    auto *copyButton = card.findChild<QToolButton *>(QStringLiteral("copyButton"));
     auto *removeButton = card.findChild<QToolButton *>(QStringLiteral("removeButton"));
     const auto buttonFits = [&card](QWidget *button) {
         if (!button || !button->isVisible())
@@ -2996,7 +3776,7 @@ bool runSelfTest()
         return card.rect().contains(geometry.topLeft())
             && card.rect().contains(geometry.bottomRight());
     };
-    if (!buttonFits(pinButton) || !buttonFits(removeButton))
+    if (!buttonFits(copyButton) || !buttonFits(pinButton) || !buttonFits(removeButton))
         return false;
 
     bool pinSignalReceived = false;
@@ -3090,6 +3870,12 @@ bool runSelfTest()
             || toast->geometry().center().y() < panel->height() / 2) {
             return false;
         }
+        // Register a normal child in the hover-tracking callbacks. Destroying
+        // ShelfWindow at the end of this scope must disconnect that callback
+        // before its tracking sets are torn down.
+        QEnterEvent trackedControlEnter(QPointF(2, 2), QPointF(2, 2), QPointF(2, 2));
+        QApplication::sendEvent(pasteButton, &trackedControlEnter);
+        QApplication::processEvents();
         if (handleLock->isChecked())
             handleLock->click();
         handleLock->click();
@@ -3130,6 +3916,28 @@ bool runSelfTest()
         }
 
         const QString clipboardGroupId = reloaded.groups().first().id;
+        CardWidget *clipboardCard = nullptr;
+        for (auto *candidate : shelf.findChildren<CardWidget *>()) {
+            if (candidate->groupId() == clipboardGroupId) {
+                clipboardCard = candidate;
+                break;
+            }
+        }
+        auto *clipboardCopyButton = clipboardCard
+            ? clipboardCard->findChild<QToolButton *>(QStringLiteral("copyButton"))
+            : nullptr;
+        if (!clipboardCopyButton)
+            return false;
+        clipboardCopyButton->click();
+        QApplication::processEvents();
+        const QMimeData *copiedMime = QApplication::clipboard()->mimeData(QClipboard::Clipboard);
+        if (!copiedMime || copiedMime->text() != QStringLiteral("Clipboard button insertion")
+            || copiedMime->html() != QStringLiteral("<b>Clipboard button insertion</b>")
+            || copiedMime->hasFormat(QString::fromLatin1(kInternalMime))
+            || toast->isHidden() || toast->text() != QStringLiteral("✓  Copied to clipboard")) {
+            return false;
+        }
+
         auto *reorderIndicator = shelf.findChild<QFrame *>(QStringLiteral("reorderIndicator"));
         auto *cardsHost = shelf.findChild<QWidget *>(QStringLiteral("cardsHost"));
         if (!reorderIndicator || !cardsHost)
@@ -3171,7 +3979,8 @@ bool runSelfTest()
             return false;
         }
         const QString noteId = reloaded.groups().first().id;
-        reloaded.setPinned(noteId, true);
+        if (!reloaded.setPinned(noteId, true))
+            return false;
         if (!shelf.editTextNoteForTest(noteId, QStringLiteral("An edited quick note\nwith new text")))
             return false;
         if (toast->isHidden() || toast->text() != QStringLiteral("✓  Text note updated"))

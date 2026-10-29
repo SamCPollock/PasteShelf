@@ -303,6 +303,7 @@ class ShelfModel(QAbstractListModel):
         finally:
             self._set_drag_active(False)
             self.refreshMissing()
+            drag.deleteLater()
         if result == Qt.DropAction.CopyAction:
             self._schedule_successful_drag_removal(group_id, item_id)
         else:

@@ -37,6 +37,13 @@ class StorageAndMimeTests(unittest.TestCase):
         with sqlite3.connect(self.storage.db_path) as db:
             self.assertEqual(db.execute("PRAGMA user_version").fetchone()[0], SCHEMA_VERSION)
 
+    def test_storage_permissions_are_private(self) -> None:
+        self.assertEqual(self.storage.root.stat().st_mode & 0o077, 0)
+        self.assertEqual(self.storage.content_dir.stat().st_mode & 0o077, 0)
+        self.assertEqual(self.storage.db_path.stat().st_mode & 0o077, 0)
+        for sidecar in self.storage.root.glob("items.sqlite3-*"):
+            self.assertEqual(sidecar.stat().st_mode & 0o077, 0)
+
     def test_legacy_state_migrates_to_pasteshelf(self) -> None:
         data_home = self.root / "xdg-data"
         config_home = self.root / "xdg-config"

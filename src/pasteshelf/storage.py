@@ -21,12 +21,25 @@ class ShelfStorage:
         self.content_dir = self.root / "content"
         self.root.mkdir(parents=True, exist_ok=True)
         self.content_dir.mkdir(parents=True, exist_ok=True)
+        os.chmod(self.root, 0o700)
+        os.chmod(self.content_dir, 0o700)
         self.db_path = self.root / "items.sqlite3"
         self._db = sqlite3.connect(self.db_path)
         self._db.row_factory = sqlite3.Row
         self._db.execute("PRAGMA foreign_keys = ON")
         self._db.execute("PRAGMA journal_mode = WAL")
         self._initialize_schema()
+        self._harden_permissions()
+
+    def _harden_permissions(self) -> None:
+        """Keep clipboard-derived metadata and payloads private to the user."""
+        for path in (
+            self.db_path,
+            Path(f"{self.db_path}-wal"),
+            Path(f"{self.db_path}-shm"),
+        ):
+            if path.exists():
+                os.chmod(path, 0o600)
 
     def close(self) -> None:
         self._db.close()
