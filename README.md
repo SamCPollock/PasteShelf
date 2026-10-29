@@ -71,8 +71,9 @@ Then launch **PasteShelf Native** from KDE. Login startup remains disabled. The
 native build supports file/folder stacks, text and HTML, links, screenshots,
 transactional persistence, pinning cards, drag-out copy semantics, removal
 animations, persistent drag reordering, full hover previews, drawer pinning,
-screen/edge selection, tray actions, and crash-safe single-instance recovery.
-It uses scaled-at-decode thumbnails and has no polling loop.
+quick text-note creation, screen/edge selection, tray actions, and crash-safe
+single-instance recovery. It uses scaled-at-decode thumbnails and has no
+polling loop. Double-click a copied or created text card to edit it in place.
 
 The native build intentionally omits the original app's global clipboard
 shortcut while both versions are installed, avoiding a shortcut collision.

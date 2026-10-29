@@ -5,6 +5,8 @@
 #include <QCloseEvent>
 #include <QCursor>
 #include <QDesktopServices>
+#include <QDialog>
+#include <QDialogButtonBox>
 #include <QDir>
 #include <QDrag>
 #include <QDragEnterEvent>
@@ -33,6 +35,7 @@
 #include <QPainter>
 #include <QPainterPath>
 #include <QParallelAnimationGroup>
+#include <QPlainTextEdit>
 #include <QProcess>
 #include <QPropertyAnimation>
 #include <QPointer>
@@ -265,6 +268,35 @@ public:
                 return;
             }
         }
+    }
+
+    bool updateText(const QString &id, const QString &text)
+    {
+        if (text.trimmed().isEmpty())
+            return false;
+        for (auto &group : m_groups) {
+            if (group.id != id)
+                continue;
+            if (group.items.size() != 1)
+                return false;
+            auto &item = group.items.first();
+            if (item.kind != QLatin1String("text") && item.kind != QLatin1String("html"))
+                return false;
+
+            const ShelfGroup original = group;
+            item.kind = QStringLiteral("text");
+            item.title = compactText(text);
+            item.value.clear();
+            item.plainText = text;
+            item.html.clear();
+            item.owned = false;
+            group.title = item.title;
+            if (save())
+                return true;
+            group = original;
+            return false;
+        }
+        return false;
     }
 
     bool reorderGroup(const QString &id, int destinationIndex)
@@ -835,6 +867,14 @@ public:
         createDetails(root);
         createHoverPreview();
         installHoverRouting();
+        m_singleClickTimer.setSingleShot(true);
+        m_singleClickTimer.setInterval(QApplication::doubleClickInterval());
+        connect(&m_singleClickTimer, &QTimer::timeout, this, [this] {
+            if (m_expandable)
+                setExpanded(!m_expanded);
+        });
+        if (isEditableText())
+            m_previewHoverZone->setToolTip(QStringLiteral("Double-click to edit"));
     }
 
     void showPreviewForTest()
@@ -877,6 +917,7 @@ signals:
     void removeRequested(const QString &id);
     void removeItemRequested(const QString &groupId, const QString &itemId);
     void dragActiveChanged(bool active);
+    void editTextRequested(const QString &id, const QString &text);
 
 protected:
     bool eventFilter(QObject *watched, QEvent *event) override
@@ -929,6 +970,7 @@ protected:
     void mousePressEvent(QMouseEvent *event) override
     {
         if (event->button() == Qt::LeftButton) {
+            m_singleClickTimer.stop();
             m_pressPosition = event->position().toPoint();
             m_clickCandidate = true;
             setCursor(Qt::ClosedHandCursor);
@@ -939,8 +981,12 @@ protected:
     void mouseReleaseEvent(QMouseEvent *event) override
     {
         setCursor(Qt::OpenHandCursor);
-        if (event->button() == Qt::LeftButton && m_clickCandidate && m_expandable)
-            setExpanded(!m_expanded);
+        if (event->button() == Qt::LeftButton && m_clickCandidate && m_expandable) {
+            if (isEditableText())
+                m_singleClickTimer.start();
+            else
+                setExpanded(!m_expanded);
+        }
         m_clickCandidate = false;
         QFrame::mouseReleaseEvent(event);
     }
@@ -953,6 +999,7 @@ protected:
             return;
         }
         m_clickCandidate = false;
+        m_singleClickTimer.stop();
         m_showPreviewTimer.stop();
         if (m_previewPopup) m_previewPopup->hide();
         auto mime = m_store->mimeFor(m_group.id);
@@ -970,7 +1017,29 @@ protected:
             poof(true);
     }
 
+    void mouseDoubleClickEvent(QMouseEvent *event) override
+    {
+        if (event->button() == Qt::LeftButton && isEditableText()) {
+            m_clickCandidate = false;
+            m_singleClickTimer.stop();
+            m_showPreviewTimer.stop();
+            if (m_previewPopup)
+                m_previewPopup->hide();
+            emit editTextRequested(m_group.id, m_group.items.first().plainText);
+            event->accept();
+            return;
+        }
+        QFrame::mouseDoubleClickEvent(event);
+    }
+
 private:
+    bool isEditableText() const
+    {
+        return m_group.items.size() == 1
+            && (m_group.items.first().kind == QLatin1String("text")
+                || m_group.items.first().kind == QLatin1String("html"));
+    }
+
     void installHoverRouting()
     {
         const auto installOnTree = [this](QWidget *root) {
@@ -1166,6 +1235,7 @@ private:
     QPointer<HoverPreview> m_previewPopup;
     QTimer m_showPreviewTimer;
     QTimer m_hidePreviewTimer;
+    QTimer m_singleClickTimer;
     QSet<QObject *> m_previewHoveredParts;
     QPoint m_pressPosition;
     bool m_pinned = false;
@@ -1399,11 +1469,14 @@ public:
             }
             animateHandleFill(0.0, kCloseDrainMs);
         });
-        m_hintTimer.setSingleShot(true);
-        connect(&m_hintTimer, &QTimer::timeout, this, [this] {
-            if (!m_dragActive)
-                setDropHintActive(false);
+        m_hoverOpenTimer.setSingleShot(true);
+        m_hoverOpenTimer.setInterval(kHoverOpenDelayMs);
+        connect(&m_hoverOpenTimer, &QTimer::timeout, this, [this] {
+            if (!m_expanded && !m_hoveredWidgets.isEmpty() && !m_dragActive && !m_manualCollapse)
+                openShelf();
         });
+        m_toastTimer.setSingleShot(true);
+        connect(&m_toastTimer, &QTimer::timeout, m_toast, &QWidget::hide);
 
         connect(qApp, &QGuiApplication::screenAdded, this, [this] { updatePositionTitle(); });
         connect(qApp, &QGuiApplication::screenRemoved, this, [this] { updatePositionTitle(); });
@@ -1457,6 +1530,12 @@ public:
     qreal handleFillForTest() const { return m_handle->fillProgress(); }
     QToolButton *handleLockButtonForTest() const { return m_handleLockButton; }
     QWidget *handleWidgetForTest() const { return m_handle; }
+    static QPoint handleTopLeftForTest(const QRect &area, const QString &placement)
+    {
+        return handleTopLeftForArea(area, placement);
+    }
+    bool addTextNoteForTest(const QString &text) { return addTextNote(text); }
+    bool editTextNoteForTest(const QString &id, const QString &text) { return editTextNote(id, text); }
     bool firstPreviewAlignedForTest() const
     {
         auto *card = findChild<CardWidget *>();
@@ -1479,6 +1558,8 @@ public:
 public slots:
     void openShelf()
     {
+        m_manualCollapse = false;
+        m_hoverOpenTimer.stop();
         cancelCloseCountdown();
         if (m_expanded && !m_animating) {
             raise();
@@ -1493,6 +1574,18 @@ public slots:
         if (m_pinnedOpen || m_dragActive || !m_expanded)
             return;
         animateTo(false);
+    }
+
+    void shrinkShelf()
+    {
+        m_manualCollapse = true;
+        m_hoverOpenTimer.stop();
+        m_closeTimer.stop();
+        m_drainDelayTimer.stop();
+        if (m_pinnedOpen)
+            setPinnedOpen(false);
+        if (m_expanded)
+            animateTo(false);
     }
 
     void runAnimationStressTest()
@@ -1637,9 +1730,15 @@ protected:
                     });
                 }
                 m_hoveredWidgets.insert(widget);
-                cancelCloseCountdown();
-                if (!m_expanded)
-                    openShelf();
+                if (m_manualCollapse)
+                    return QWidget::eventFilter(watched, event);
+                if (!m_expanded) {
+                    m_hoverOpenTimer.start();
+                } else {
+                    cancelCloseCountdown();
+                    if (m_animating)
+                        openShelf();
+                }
             } else if (event->type() == QEvent::Leave || event->type() == QEvent::Hide) {
                 m_hoveredWidgets.remove(widget);
                 scheduleCloseAfterPointerLeave();
@@ -1650,8 +1749,17 @@ protected:
 
     void enterEvent(QEnterEvent *event) override
     {
-        cancelCloseCountdown();
-        if (!m_expanded) openShelf();
+        if (m_manualCollapse) {
+            QWidget::enterEvent(event);
+            return;
+        }
+        if (!m_expanded) {
+            m_hoverOpenTimer.start();
+        } else {
+            cancelCloseCountdown();
+            if (m_animating)
+                openShelf();
+        }
         QWidget::enterEvent(event);
     }
 
@@ -1761,8 +1869,11 @@ private:
     static constexpr int kPanelWidth = 400;
     static constexpr int kPanelHeight = 580;
     static constexpr int kSurfaceGap = 8;
+    static constexpr int kHorizontalEdgeInset = 12;
+    static constexpr int kCornerVerticalInset = 48;
     static constexpr int kCloseHoldMs = 1500;
     static constexpr int kCloseDrainMs = 1500;
+    static constexpr int kHoverOpenDelayMs = 300;
     static QSize collapsedSize() { return {1, kHandleHeight}; }
     static QSize expandedSize() { return {kPanelWidth, kPanelHeight}; }
 
@@ -1780,6 +1891,21 @@ private:
     bool handleIsOnLeft() const
     {
         return m_placement.contains(QStringLiteral("left"));
+    }
+
+    static QPoint handleTopLeftForArea(const QRect &area, const QString &placement)
+    {
+        int x = area.x() + (area.width() - kHandleWidth) / 2;
+        int y = area.y() + (area.height() - kHandleHeight) / 2;
+        if (placement.contains(QStringLiteral("left")))
+            x = area.x() + kHorizontalEdgeInset;
+        if (placement.contains(QStringLiteral("right")))
+            x = area.x() + area.width() - kHandleWidth - kHorizontalEdgeInset;
+        if (placement.contains(QStringLiteral("top")))
+            y = area.y() + kCornerVerticalInset;
+        if (placement.contains(QStringLiteral("bottom")))
+            y = area.y() + area.height() - kHandleHeight - kCornerVerticalInset;
+        return {x, y};
     }
 
     int panelVerticalOffset(int surfaceHeight) const
@@ -1873,6 +1999,10 @@ private:
     void scheduleCloseAfterPointerLeave()
     {
         QTimer::singleShot(0, this, [this] {
+            if (m_hoveredWidgets.isEmpty())
+                m_hoverOpenTimer.stop();
+            if (m_hoveredWidgets.isEmpty())
+                m_manualCollapse = false;
             if (m_hoveredWidgets.isEmpty() && !m_pinnedOpen && !m_dragActive && !m_menuActive)
                 armCloseCountdown();
         });
@@ -2023,6 +2153,25 @@ private:
         pasteButton->setCursor(Qt::PointingHandCursor);
         connect(pasteButton, &QToolButton::clicked, this, &ShelfWindow::addClipboardContent);
         header->addWidget(pasteButton);
+        auto *newTextButton = new QToolButton(m_panel);
+        newTextButton->setObjectName(QStringLiteral("newTextButton"));
+        const QIcon addIcon = QIcon::fromTheme(QStringLiteral("list-add"));
+        if (addIcon.isNull())
+            newTextButton->setText(QStringLiteral("+"));
+        else
+            newTextButton->setIcon(addIcon);
+        newTextButton->setToolTip(QStringLiteral("New text note"));
+        newTextButton->setFixedSize(30, 30);
+        newTextButton->setCursor(Qt::PointingHandCursor);
+        connect(newTextButton, &QToolButton::clicked, this, &ShelfWindow::showNewTextNoteDialog);
+        header->addWidget(newTextButton);
+        m_shrinkButton = new QToolButton(m_panel);
+        m_shrinkButton->setObjectName(QStringLiteral("shrinkButton"));
+        m_shrinkButton->setToolTip(QStringLiteral("Shrink shelf"));
+        m_shrinkButton->setFixedSize(30, 30);
+        m_shrinkButton->setCursor(Qt::PointingHandCursor);
+        connect(m_shrinkButton, &QToolButton::clicked, this, &ShelfWindow::shrinkShelf);
+        header->addWidget(m_shrinkButton);
         auto *menuButton = new QToolButton(m_panel);
         menuButton->setText(QStringLiteral("⋮"));
         menuButton->setObjectName(QStringLiteral("menuButton"));
@@ -2065,6 +2214,13 @@ private:
         m_reorderIndicator->setFixedHeight(4);
         m_reorderIndicator->hide();
 
+        m_toast = new QLabel(m_panel);
+        m_toast->setObjectName(QStringLiteral("toast"));
+        m_toast->setAlignment(Qt::AlignCenter);
+        m_toast->setAttribute(Qt::WA_TransparentForMouseEvents);
+        m_toast->setGeometry(16, kPanelHeight - 52, kPanelWidth - 32, 36);
+        m_toast->hide();
+
     }
 
     void applyStyle()
@@ -2084,10 +2240,15 @@ private:
             #nativeBadge { color: %7; background: %5; border-radius: 7px; padding: 2px 7px; font-size: 8px; font-weight: 700; }
             #pasteButton { color: %3; background: %2; border: 1px solid %6; border-radius: 7px; padding: 2px 8px; font-weight: 600; }
             #pasteButton:hover { border-color: %5; background: %1; }
+            #newTextButton { color: %3; background: %2; border: 1px solid %6; border-radius: 7px; font-size: 19px; font-weight: 600; }
+            #newTextButton:hover { border-color: %5; background: %1; }
+            #shrinkButton { color: %3; background: %2; border: 1px solid %6; border-radius: 7px; font-size: 19px; font-weight: 600; }
+            #shrinkButton:hover { border-color: %5; background: %1; }
             #menuButton { border: 1px solid %6; border-radius: 7px; font-size: 19px; }
             #menuButton:hover { background: %2; }
             #dropHint { color: %4; background: %2; border: 1px solid %6; border-radius: 9px; }
             #dropHint[active="true"] { color: %3; border: 2px solid %5; background: %2; font-weight: 600; }
+            #toast { color: %7; background: %5; border: 1px solid %6; border-radius: 9px; padding: 5px 10px; font-weight: 600; }
             #reorderIndicator { background: %5; border: none; border-radius: 2px; }
             #card { background: %2; border: 1px solid %6; border-radius: 11px; }
             #card:hover { border: 1px solid %5; background: %1; }
@@ -2104,6 +2265,8 @@ private:
             #previewTitle { color: %3; font-size: 14px; font-weight: 700; }
             #previewBody { color: %3; background: transparent; font-size: 12px; }
             #previewScroll, #previewScroll > QWidget > QWidget { background: transparent; }
+            #noteEditor { color: %3; background: %2; border: 1px solid %6; border-radius: 9px; padding: 8px; selection-background-color: %5; }
+            #noteEditor:focus { border: 2px solid %5; }
             QToolButton { border: none; border-radius: 7px; color: %4; }
             QToolButton:hover { background: %2; color: %3; }
             #pinButton[pinned="true"] { color: %7; background: %5; }
@@ -2148,6 +2311,8 @@ private:
             connect(card, &CardWidget::pinChanged, this, [this](const QString &id, bool pinned) {
                 m_store->setPinned(id, pinned);
             });
+            connect(card, &CardWidget::editTextRequested,
+                this, &ShelfWindow::showEditTextDialog);
             connect(card, &CardWidget::removeRequested, this, [this](const QString &id) {
                 m_store->remove(id);
                 rebuildCards();
@@ -2233,7 +2398,6 @@ private:
 
     void setDropHintActive(bool active)
     {
-        m_hintTimer.stop();
         m_dropHint->setText(active ? QStringLiteral("↓  Release to add") : QString());
         m_dropHint->setProperty("active", active);
         m_dropHint->style()->unpolish(m_dropHint);
@@ -2244,13 +2408,11 @@ private:
 
     void showTransientHint(const QString &message, int duration)
     {
-        m_dropHint->setProperty("active", false);
-        m_dropHint->setText(message);
-        m_dropHint->style()->unpolish(m_dropHint);
-        m_dropHint->style()->polish(m_dropHint);
-        m_dropHint->setFixedHeight(34);
-        m_dropHint->show();
-        m_hintTimer.start(duration);
+        m_toastTimer.stop();
+        m_toast->setText(message);
+        m_toast->show();
+        m_toast->raise();
+        m_toastTimer.start(duration);
     }
 
     QScreen *selectedScreen() const
@@ -2268,14 +2430,7 @@ private:
         QScreen *screen = selectedScreen();
         if (!screen)
             return {};
-        const QRect area = screen->availableGeometry();
-        int x = area.x() + (area.width() - kHandleWidth) / 2;
-        int y = area.y() + (area.height() - kHandleHeight) / 2;
-        if (m_placement.contains(QStringLiteral("left"))) x = area.x() + 12;
-        if (m_placement.contains(QStringLiteral("right"))) x = area.right() - kHandleWidth - 11;
-        if (m_placement.contains(QStringLiteral("top"))) y = area.y() + 12;
-        if (m_placement.contains(QStringLiteral("bottom"))) y = area.bottom() - kHandleHeight - 11;
-        return {x, y};
+        return handleTopLeftForArea(screen->availableGeometry(), m_placement);
     }
 
     QPoint desiredSurfaceTopLeft() const
@@ -2327,6 +2482,18 @@ private:
         const QPoint surfaceTopLeft = desiredSurfaceTopLeft();
         if (m_handleArrow)
             m_handleArrow->setText(handleIsOnLeft() ? QStringLiteral("›") : QStringLiteral("‹"));
+        if (m_shrinkButton) {
+            const QIcon shrinkIcon = QIcon::fromTheme(handleIsOnLeft()
+                    ? QStringLiteral("go-previous")
+                    : QStringLiteral("go-next"));
+            if (shrinkIcon.isNull()) {
+                m_shrinkButton->setIcon({});
+                m_shrinkButton->setText(handleIsOnLeft() ? QStringLiteral("‹") : QStringLiteral("›"));
+            } else {
+                m_shrinkButton->setIcon(shrinkIcon);
+                m_shrinkButton->setText(QString());
+            }
+        }
         layoutSurfaces();
         setWindowTitle(QStringLiteral("PasteShelfNative@%1,%2,%3,%4")
             .arg(surfaceTopLeft.x()).arg(surfaceTopLeft.y()).arg(width()).arg(height()));
@@ -2457,6 +2624,95 @@ private:
         }
     }
 
+    bool addTextNote(const QString &text)
+    {
+        if (text.trimmed().isEmpty())
+            return false;
+        QMimeData mime;
+        mime.setText(text);
+        if (!m_store->add(&mime)) {
+            showTransientHint(QStringLiteral("Could not save text note"), 1500);
+            return false;
+        }
+        rebuildCards();
+        openShelf();
+        showTransientHint(QStringLiteral("✓  Text note added"), 1200);
+        return true;
+    }
+
+    bool editTextNote(const QString &id, const QString &text)
+    {
+        if (!m_store->updateText(id, text)) {
+            showTransientHint(text.trimmed().isEmpty()
+                    ? QStringLiteral("Text notes cannot be empty")
+                    : QStringLiteral("Could not update text note"),
+                1500);
+            return false;
+        }
+        rebuildCards();
+        openShelf();
+        showTransientHint(QStringLiteral("✓  Text note updated"), 1200);
+        return true;
+    }
+
+    void showNewTextNoteDialog()
+    {
+        showTextDialog({}, {});
+    }
+
+    void showEditTextDialog(const QString &id, const QString &text)
+    {
+        showTextDialog(id, text);
+    }
+
+    void showTextDialog(const QString &editingId, const QString &initialText)
+    {
+        const bool editing = !editingId.isEmpty();
+        m_menuActive = true;
+        cancelCloseCountdown();
+
+        QDialog dialog(this);
+        dialog.setWindowTitle(editing ? QStringLiteral("Edit text note") : QStringLiteral("New text note"));
+        dialog.setModal(true);
+        dialog.resize(430, 285);
+        auto *layout = new QVBoxLayout(&dialog);
+        layout->setContentsMargins(14, 14, 14, 14);
+        layout->setSpacing(10);
+
+        auto *editor = new QPlainTextEdit(&dialog);
+        editor->setObjectName(QStringLiteral("noteEditor"));
+        editor->setPlaceholderText(QStringLiteral("Type a note to keep on the shelf…"));
+        editor->setPlainText(initialText);
+        editor->setTabChangesFocus(false);
+        layout->addWidget(editor, 1);
+
+        auto *buttons = new QDialogButtonBox(QDialogButtonBox::Cancel, &dialog);
+        auto *saveButton = buttons->addButton(
+            editing ? QStringLiteral("Save changes") : QStringLiteral("Add note"),
+            QDialogButtonBox::AcceptRole);
+        saveButton->setDefault(true);
+        saveButton->setEnabled(!initialText.trimmed().isEmpty());
+        connect(editor, &QPlainTextEdit::textChanged, &dialog, [editor, saveButton] {
+            saveButton->setEnabled(!editor->toPlainText().trimmed().isEmpty());
+        });
+        connect(buttons, &QDialogButtonBox::accepted, &dialog, &QDialog::accept);
+        connect(buttons, &QDialogButtonBox::rejected, &dialog, &QDialog::reject);
+        layout->addWidget(buttons);
+
+        editor->setFocus();
+        const int result = dialog.exec();
+        if (result == QDialog::Accepted) {
+            if (editing)
+                editTextNote(editingId, editor->toPlainText());
+            else
+                addTextNote(editor->toPlainText());
+        }
+
+        m_menuActive = false;
+        if (!m_pinnedOpen)
+            scheduleCloseAfterPointerLeave();
+    }
+
     void createTray()
     {
         if (!QSystemTrayIcon::isSystemTrayAvailable())
@@ -2464,6 +2720,8 @@ private:
         m_tray = new QSystemTrayIcon(windowIcon(), this);
         m_tray->setToolTip(QStringLiteral("PasteShelf Native (optimized test build)"));
         auto *menu = new QMenu;
+        QAction *newText = menu->addAction(QStringLiteral("New text note…"));
+        connect(newText, &QAction::triggered, this, &ShelfWindow::showNewTextNoteDialog);
         QAction *clipboard = menu->addAction(QStringLiteral("Add clipboard"));
         connect(clipboard, &QAction::triggered, this, &ShelfWindow::addClipboardContent);
         QAction *show = menu->addAction(QStringLiteral("Show PasteShelf Native"));
@@ -2487,8 +2745,10 @@ private:
     QLabel *m_handleArrow = nullptr;
     QLabel *m_handleCount = nullptr;
     QToolButton *m_handleLockButton = nullptr;
+    QToolButton *m_shrinkButton = nullptr;
     QWidget *m_panel = nullptr;
     QLabel *m_dropHint = nullptr;
+    QLabel *m_toast = nullptr;
     QScrollArea *m_scroll = nullptr;
     QWidget *m_cardsHost = nullptr;
     QVBoxLayout *m_cardsLayout = nullptr;
@@ -2500,7 +2760,8 @@ private:
     QSet<QWidget *> m_hoveredWidgets;
     QTimer m_closeTimer;
     QTimer m_drainDelayTimer;
-    QTimer m_hintTimer;
+    QTimer m_hoverOpenTimer;
+    QTimer m_toastTimer;
     QString m_internalReorderGroupId;
     QString m_placement;
     QString m_screenName;
@@ -2509,6 +2770,7 @@ private:
     bool m_dragActive = false;
     bool m_menuActive = false;
     bool m_animating = false;
+    bool m_manualCollapse = false;
     bool m_ignoreHoverForTest = false;
     qreal m_openProgress = 0.0;
 };
@@ -2584,6 +2846,14 @@ private:
 
 bool runSelfTest()
 {
+    const QRect placementArea(100, 50, 1920, 1080);
+    if (ShelfWindow::handleTopLeftForTest(placementArea, QStringLiteral("top-left")) != QPoint(112, 98)
+        || ShelfWindow::handleTopLeftForTest(placementArea, QStringLiteral("top-right")) != QPoint(1962, 98)
+        || ShelfWindow::handleTopLeftForTest(placementArea, QStringLiteral("bottom-left")) != QPoint(112, 934)
+        || ShelfWindow::handleTopLeftForTest(placementArea, QStringLiteral("bottom-right")) != QPoint(1962, 934)) {
+        return false;
+    }
+
     QTemporaryDir directory;
     if (!directory.isValid())
         return false;
@@ -2600,6 +2870,13 @@ bool runSelfTest()
         if (!output || output->text() != mime.text() || output->html() != mime.html())
             return false;
         store.setPinned(textGroupId, true);
+        if (!store.updateText(textGroupId, QStringLiteral("Edited copied text")))
+            return false;
+        const auto editedOutput = store.mimeFor(textGroupId);
+        if (!editedOutput || editedOutput->text() != QStringLiteral("Edited copied text")
+            || editedOutput->hasHtml() || !store.group(textGroupId)->pinned) {
+            return false;
+        }
 
         const QString firstPath = directory.path() + QStringLiteral("/source-one.txt");
         const QString secondPath = directory.path() + QStringLiteral("/source-two.txt");
@@ -2654,7 +2931,8 @@ bool runSelfTest()
     if (reloaded.groups().size() != 1
         || reloaded.groups().first().id != textGroupId
         || !reloaded.groups().first().pinned
-        || reloaded.groups().first().items.first().plainText != QStringLiteral("Native text round trip")) {
+        || reloaded.groups().first().items.first().plainText != QStringLiteral("Edited copied text")
+        || reloaded.groups().first().items.first().kind != QLatin1String("text")) {
         return false;
     }
 
@@ -2732,6 +3010,24 @@ bool runSelfTest()
     if (!pinSignalReceived || resultingPinValue)
         return false;
 
+    bool editSignalReceived = false;
+    QString editedGroupId;
+    QString editInitialText;
+    QObject::connect(&card, &CardWidget::editTextRequested,
+        [&editSignalReceived, &editedGroupId, &editInitialText](const QString &id, const QString &text) {
+            editSignalReceived = true;
+            editedGroupId = id;
+            editInitialText = text;
+        });
+    QMouseEvent doubleClick(QEvent::MouseButtonDblClick, QPointF(12, 12),
+        QPointF(card.mapToGlobal(QPoint(12, 12))),
+        Qt::LeftButton, Qt::LeftButton, Qt::NoModifier);
+    QApplication::sendEvent(&card, &doubleClick);
+    if (!editSignalReceived || editedGroupId != uiGroup.id
+        || editInitialText != uiGroup.items.first().plainText) {
+        return false;
+    }
+
     auto *previewZone = card.findChild<QWidget *>(QStringLiteral("previewHoverZone"));
     auto *actionStrip = card.findChild<QWidget *>(QStringLiteral("cardActionStrip"));
     if (!previewZone || !actionStrip)
@@ -2780,19 +3076,33 @@ bool runSelfTest()
     {
         ShelfWindow shelf(&reloaded);
         auto *pasteButton = shelf.findChild<QToolButton *>(QStringLiteral("pasteButton"));
+        auto *newTextButton = shelf.findChild<QToolButton *>(QStringLiteral("newTextButton"));
+        auto *shrinkButton = shelf.findChild<QToolButton *>(QStringLiteral("shrinkButton"));
         auto *handleLock = shelf.handleLockButtonForTest();
         auto *handle = shelf.handleWidgetForTest();
         auto *dropHint = shelf.findChild<QLabel *>(QStringLiteral("dropHint"));
-        if (!pasteButton || !handleLock || !handle || !dropHint || !dropHint->isHidden())
+        auto *toast = shelf.findChild<QLabel *>(QStringLiteral("toast"));
+        auto *panel = shelf.findChild<QWidget *>(QStringLiteral("panel"));
+        if (!pasteButton || !newTextButton || newTextButton->toolTip() != QStringLiteral("New text note")
+            || !shrinkButton || shrinkButton->toolTip() != QStringLiteral("Shrink shelf")
+            || !handleLock || !handle || !dropHint || !dropHint->isHidden()
+            || !toast || !toast->isHidden() || !panel || panel->layout()->indexOf(toast) >= 0
+            || toast->geometry().center().y() < panel->height() / 2) {
             return false;
+        }
         if (handleLock->isChecked())
             handleLock->click();
         handleLock->click();
         if (!shelf.pinnedOpenForTest() || !shelf.expandedForTest() || !handleLock->isChecked())
             return false;
-        handleLock->click();
-        if (shelf.pinnedOpenForTest() || handleLock->isChecked())
+        shrinkButton->click();
+        QEventLoop shrinkWait;
+        QTimer::singleShot(260, &shrinkWait, &QEventLoop::quit);
+        shrinkWait.exec();
+        if (shelf.pinnedOpenForTest() || handleLock->isChecked()
+            || shelf.expandedForTest() || shelf.panelVisibleForTest()) {
             return false;
+        }
 
         QMimeData draggedText;
         draggedText.setText(QStringLiteral("Handle drag forwarding"));
@@ -2814,8 +3124,10 @@ bool runSelfTest()
         QEventLoop shelfLayoutWait;
         QTimer::singleShot(260, &shelfLayoutWait, &QEventLoop::quit);
         shelfLayoutWait.exec();
-        if (dropHint->isHidden() || dropHint->text() != QStringLiteral("✓  Added from clipboard"))
+        if (!dropHint->isHidden() || toast->isHidden()
+            || toast->text() != QStringLiteral("✓  Added from clipboard")) {
             return false;
+        }
 
         const QString clipboardGroupId = reloaded.groups().first().id;
         auto *reorderIndicator = shelf.findChild<QFrame *>(QStringLiteral("reorderIndicator"));
@@ -2851,6 +3163,26 @@ bool runSelfTest()
         shelf.showFirstPreviewForTest();
         QApplication::processEvents();
         if (!shelf.firstPreviewAlignedForTest())
+            return false;
+        const int groupCountBeforeNote = reloaded.groups().size();
+        if (shelf.addTextNoteForTest(QStringLiteral(" \n\t"))
+            || reloaded.groups().size() != groupCountBeforeNote
+            || !shelf.addTextNoteForTest(QStringLiteral("A quick shelf note\nwith a second line"))) {
+            return false;
+        }
+        const QString noteId = reloaded.groups().first().id;
+        reloaded.setPinned(noteId, true);
+        if (!shelf.editTextNoteForTest(noteId, QStringLiteral("An edited quick note\nwith new text")))
+            return false;
+        if (toast->isHidden() || toast->text() != QStringLiteral("✓  Text note updated"))
+            return false;
+        const ShelfGroup *note = reloaded.group(noteId);
+        if (!note || note->items.size() != 1 || note->items.first().kind != QLatin1String("text")
+            || note->items.first().plainText != QStringLiteral("An edited quick note\nwith new text")
+            || !note->pinned || reloaded.groups().size() != groupCountBeforeNote + 1) {
+            return false;
+        }
+        if (!reloaded.remove(noteId))
             return false;
     }
     QApplication::clipboard()->clear(QClipboard::Clipboard);
@@ -2972,6 +3304,34 @@ int main(int argc, char **argv)
                 && *anchorStable;
             app.exit(anchoredClosed ? 0 : 1);
         });
+    } else if (arguments.contains(QStringLiteral("--hover-open-delay-test"))) {
+        auto quickPassStayedClosed = std::make_shared<bool>(false);
+        auto deliberateHoverStayedClosedInitially = std::make_shared<bool>(false);
+        QTimer::singleShot(80, &window, [&window] {
+            QEnterEvent enter(QPointF(4, 4), QPointF(4, 4), QPointF(4, 4));
+            QApplication::sendEvent(window.handleWidgetForTest(), &enter);
+        });
+        QTimer::singleShot(200, &window, [&window] {
+            QEvent leave(QEvent::Leave);
+            QApplication::sendEvent(window.handleWidgetForTest(), &leave);
+        });
+        QTimer::singleShot(460, &window, [&window, quickPassStayedClosed] {
+            *quickPassStayedClosed = !window.expandedForTest();
+        });
+        QTimer::singleShot(520, &window, [&window] {
+            QEnterEvent enter(QPointF(4, 4), QPointF(4, 4), QPointF(4, 4));
+            QApplication::sendEvent(window.handleWidgetForTest(), &enter);
+        });
+        QTimer::singleShot(700, &window, [&window, deliberateHoverStayedClosedInitially] {
+            *deliberateHoverStayedClosedInitially = !window.expandedForTest();
+        });
+        QTimer::singleShot(940, &app,
+            [&window, &app, quickPassStayedClosed, deliberateHoverStayedClosedInitially] {
+            const bool openedAfterDelay = window.expandedForTest();
+            app.exit(*quickPassStayedClosed && *deliberateHoverStayedClosedInitially
+                    && openedAfterDelay
+                ? 0 : 1);
+        });
     } else if (arguments.contains(QStringLiteral("--hover-hold-test"))) {
         window.runHoverHoldTest();
         QTimer::singleShot(1850, &app, [&window, &app] {
@@ -2997,7 +3357,9 @@ int main(int argc, char **argv)
         });
         QTimer::singleShot(2500, fillSampler, qOverload<>(&QTimer::start));
         QTimer::singleShot(3850, fillSampler, &QTimer::stop);
-        QTimer::singleShot(4300, &app,
+        // Leave ample room after the 180 ms close animation. Busy offscreen
+        // CI/event loops can deliver the 3-second timer a few frames late.
+        QTimer::singleShot(4800, &app,
             [&window, &app, holdObserved, drainObserved, resetObserved, fillSampler] {
             fillSampler->stop();
             const bool closedAndDrained = !window.expandedForTest()

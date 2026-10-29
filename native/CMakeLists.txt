@@ -30,6 +30,9 @@ add_test(NAME native-storage-and-mime
 add_test(NAME native-animation-lifecycle
     COMMAND pasteshelf-native --no-single-instance --no-kwin --animation-stress-test
 )
+add_test(NAME native-hover-open-delay
+    COMMAND pasteshelf-native --no-single-instance --no-kwin --hover-open-delay-test
+)
 add_test(NAME native-hover-hold
     COMMAND pasteshelf-native --no-single-instance --no-kwin --hover-hold-test
 )
@@ -39,7 +42,7 @@ add_test(NAME native-hover-leave
 add_test(NAME native-anchor-animation
     COMMAND pasteshelf-native --no-single-instance --no-kwin --anchor-animation-test
 )
-set_tests_properties(native-storage-and-mime native-animation-lifecycle native-hover-hold native-hover-leave native-anchor-animation PROPERTIES
+set_tests_properties(native-storage-and-mime native-animation-lifecycle native-hover-open-delay native-hover-hold native-hover-leave native-anchor-animation PROPERTIES
     ENVIRONMENT "QT_QPA_PLATFORM=offscreen;XDG_CONFIG_HOME=${CMAKE_CURRENT_BINARY_DIR}/test-xdg/config;XDG_DATA_HOME=${CMAKE_CURRENT_BINARY_DIR}/test-xdg/data;XDG_CACHE_HOME=${CMAKE_CURRENT_BINARY_DIR}/test-xdg/cache"
     TIMEOUT 15
 )
