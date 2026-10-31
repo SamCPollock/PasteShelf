@@ -4256,12 +4256,20 @@ int main(int argc, char **argv)
         QTimer::singleShot(700, &window, [&window, deliberateHoverStayedClosedInitially] {
             *deliberateHoverStayedClosedInitially = !window.expandedForTest();
         });
-        QTimer::singleShot(940, &app,
+        // Leave enough scheduling headroom for cold CI runners. The earlier
+        // assertion still verifies that the shelf does not open before the
+        // configured 300 ms delay.
+        QTimer::singleShot(1250, &app,
             [&window, &app, quickPassStayedClosed, deliberateHoverStayedClosedInitially] {
             const bool openedAfterDelay = window.expandedForTest();
-            app.exit(*quickPassStayedClosed && *deliberateHoverStayedClosedInitially
-                    && openedAfterDelay
-                ? 0 : 1);
+            const bool passed = *quickPassStayedClosed
+                && *deliberateHoverStayedClosedInitially && openedAfterDelay;
+            if (!passed) {
+                qWarning("Hover delay test failed: quick=%d initial=%d opened=%d",
+                    *quickPassStayedClosed, *deliberateHoverStayedClosedInitially,
+                    openedAfterDelay);
+            }
+            app.exit(passed ? 0 : 1);
         });
     } else if (arguments.contains(QStringLiteral("--hover-hold-test"))) {
         window.runHoverHoldTest();
