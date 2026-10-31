@@ -259,6 +259,41 @@ public:
 
     const QList<ShelfGroup> &groups() const { return m_groups; }
 
+    bool seedOnboardingSamples()
+    {
+        // A state file, even an empty one, means the person has already used
+        // the shelf. Never repopulate samples after they clear or remove them.
+        if (!m_storageWritable || !m_groups.isEmpty() || QFileInfo::exists(m_statePath))
+            return false;
+
+        QList<ShelfGroup> samples;
+        const QStringList words = {
+            QStringLiteral("Fusilli"),
+            QStringLiteral("Penne"),
+            QStringLiteral("Spaghetti"),
+        };
+        for (const QString &word : words) {
+            const QString slug = word.toLower();
+            ShelfItem item;
+            item.id = QStringLiteral("welcome-") + slug + QStringLiteral("-text-v1");
+            item.kind = QStringLiteral("text");
+            item.title = word;
+            item.plainText = word;
+
+            ShelfGroup group;
+            group.id = QStringLiteral("welcome-") + slug + QStringLiteral("-v1");
+            group.title = word;
+            group.items.append(std::move(item));
+            samples.append(std::move(group));
+        }
+
+        m_groups = std::move(samples);
+        if (save())
+            return true;
+        m_groups.clear();
+        return false;
+    }
+
     const ShelfGroup *group(const QString &id) const
     {
         const auto it = std::find_if(m_groups.cbegin(), m_groups.cend(),
@@ -3447,6 +3482,37 @@ bool runSelfTest()
         return false;
     }
 
+    QTemporaryDir onboardingDirectory;
+    if (!onboardingDirectory.isValid())
+        return false;
+    {
+        ShelfStore onboardingStore(onboardingDirectory.path());
+        if (!onboardingStore.seedOnboardingSamples()
+            || onboardingStore.groups().size() != 3) {
+            return false;
+        }
+        const QStringList expectedWords = {
+            QStringLiteral("Fusilli"),
+            QStringLiteral("Penne"),
+            QStringLiteral("Spaghetti"),
+        };
+        for (qsizetype index = 0; index < expectedWords.size(); ++index) {
+            const ShelfGroup &group = onboardingStore.groups()[index];
+            if (group.title != expectedWords[index] || group.items.size() != 1
+                || group.items.first().kind != QLatin1String("text")
+                || group.items.first().plainText != expectedWords[index]) {
+                return false;
+            }
+        }
+        if (onboardingStore.seedOnboardingSamples() || !onboardingStore.clear())
+            return false;
+    }
+    ShelfStore clearedOnboardingStore(onboardingDirectory.path());
+    if (!clearedOnboardingStore.groups().isEmpty()
+        || clearedOnboardingStore.seedOnboardingSamples()) {
+        return false;
+    }
+
     QTemporaryDir directory;
     if (!directory.isValid())
         return false;
@@ -4249,9 +4315,17 @@ int main(int argc, char **argv)
         return 0;
 
     const QString dataRoot = migrateLegacyData();
+    const bool freshProfile = !QFileInfo::exists(
+        QDir(dataRoot).filePath(QStringLiteral("state.json")));
     ShelfStore store(dataRoot);
-    if (arguments.contains(QStringLiteral("--visual-test"))
-        || arguments.contains(QStringLiteral("--visual-stack-test")))
+    const bool visualTest = arguments.contains(QStringLiteral("--visual-test"))
+        || arguments.contains(QStringLiteral("--visual-stack-test"));
+    if (freshProfile && !visualTest
+        && !arguments.contains(QStringLiteral("--no-onboarding"))
+        && !store.seedOnboardingSamples()) {
+        qWarning("PastaShelf could not create its first-run samples.");
+    }
+    if (visualTest)
         addVisualTestData(store);
     KWinPositioner positioner;
     if (!arguments.contains(QStringLiteral("--no-kwin")))

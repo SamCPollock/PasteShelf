@@ -5,7 +5,7 @@ if(APPLE AND NOT CMAKE_OSX_DEPLOYMENT_TARGET)
         "Minimum supported macOS version")
 endif()
 
-project(PastaShelf VERSION 0.1.2 LANGUAGES CXX)
+project(PastaShelf VERSION 0.1.3 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -57,19 +57,19 @@ add_test(NAME storage-and-mime
     COMMAND pastashelf --self-test
 )
 add_test(NAME animation-lifecycle
-    COMMAND pastashelf --no-single-instance --no-kwin --animation-stress-test
+    COMMAND pastashelf --no-single-instance --no-kwin --no-onboarding --animation-stress-test
 )
 add_test(NAME hover-open-delay
-    COMMAND pastashelf --no-single-instance --no-kwin --hover-open-delay-test
+    COMMAND pastashelf --no-single-instance --no-kwin --no-onboarding --hover-open-delay-test
 )
 add_test(NAME hover-hold
-    COMMAND pastashelf --no-single-instance --no-kwin --hover-hold-test
+    COMMAND pastashelf --no-single-instance --no-kwin --no-onboarding --hover-hold-test
 )
 add_test(NAME hover-leave
-    COMMAND pastashelf --no-single-instance --no-kwin --hover-leave-test
+    COMMAND pastashelf --no-single-instance --no-kwin --no-onboarding --hover-leave-test
 )
 add_test(NAME anchor-animation
-    COMMAND pastashelf --no-single-instance --no-kwin --anchor-animation-test
+    COMMAND pastashelf --no-single-instance --no-kwin --no-onboarding --anchor-animation-test
 )
 set_tests_properties(storage-and-mime animation-lifecycle hover-open-delay hover-hold hover-leave anchor-animation PROPERTIES
     ENVIRONMENT "QT_QPA_PLATFORM=offscreen;XDG_CONFIG_HOME=${CMAKE_CURRENT_BINARY_DIR}/test-xdg/config;XDG_DATA_HOME=${CMAKE_CURRENT_BINARY_DIR}/test-xdg/data;XDG_CACHE_HOME=${CMAKE_CURRENT_BINARY_DIR}/test-xdg/cache"

@@ -10,6 +10,10 @@ images, and screenshots. Cards persist across restarts until they are removed.
 Normal files remain references to their originals; in-memory and temporary
 content is copied into PastaShelf's private data directory.
 
+A fresh profile starts with removable `Fusilli`, `Penne`, and `Spaghetti` text
+cards, so the shelf can be explored immediately. Clearing or removing those
+samples does not make them return.
+
 ## Linux (KDE Plasma)
 
 ### Requirements
