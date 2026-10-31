@@ -1,8 +1,8 @@
 [Desktop Entry]
 Type=Application
-Name=PasteShelf Native
+Name=PastaShelf
 GenericName=Drag Shelf
-Comment=Optimized native drag shelf for files and snippets
+Comment=Temporary shelf for files and snippets
 Exec=@EXEC@
 Icon=@ICON@
 Terminal=false

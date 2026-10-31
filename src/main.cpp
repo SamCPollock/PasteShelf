@@ -67,9 +67,86 @@
 
 namespace {
 
-constexpr auto kInternalMime = "application/x-pasteshelf-native-item";
-constexpr auto kDesktopId = "io.github.pasteshelf.PasteShelfNative";
+constexpr auto kInternalMime = "application/x-pastashelf-item";
+constexpr auto kDesktopId = "io.github.pastashelf.PastaShelf";
+constexpr auto kBundledIcon = ":/assets/io.github.pastashelf.PastaShelf.png";
 constexpr qint64 kMaxOwnedPayloadBytes = 100LL * 1024LL * 1024LL;
+
+QString runtimeDirectory()
+{
+    QString directory = QStandardPaths::writableLocation(QStandardPaths::RuntimeLocation);
+    if (directory.isEmpty())
+        directory = QStandardPaths::writableLocation(QStandardPaths::TempLocation);
+    QDir().mkpath(directory);
+    return directory;
+}
+
+Qt::WindowFlags shelfSurfaceFlags()
+{
+#ifdef Q_OS_LINUX
+    // These are utility surfaces for a tray application, not independent app
+    // windows. KWin still positions them through the script below, while the
+    // tool type keeps Plasma launchers and window searches from listing them.
+    return Qt::Tool | Qt::FramelessWindowHint | Qt::WindowStaysOnTopHint;
+#else
+    // On macOS Qt::Tool maps to an NSPanel that normally disappears whenever
+    // the application is inactive, which would hide PastaShelf's edge handle.
+    return Qt::Window | Qt::FramelessWindowHint | Qt::WindowStaysOnTopHint;
+#endif
+}
+
+QString migrateLegacyData()
+{
+    const QString current = QStandardPaths::writableLocation(QStandardPaths::AppDataLocation);
+    if (QFileInfo::exists(current))
+        return current;
+
+    const QDir dataHome(
+        QStandardPaths::writableLocation(QStandardPaths::GenericDataLocation));
+    const QStringList candidates = {
+        dataHome.filePath(QStringLiteral("PastaShelf/PastaShelfNative")),
+        dataHome.filePath(QStringLiteral("PasteShelf/PasteShelfNative")),
+    };
+    QString legacy;
+    for (const QString &candidate : candidates) {
+        if (QFileInfo::exists(candidate)) {
+            legacy = candidate;
+            break;
+        }
+    }
+    if (legacy.isEmpty())
+        return current;
+
+    QDir().mkpath(QFileInfo(current).absolutePath());
+    if (!QDir().rename(legacy, current)) {
+        qWarning("PastaShelf could not migrate its existing data; using it in place.");
+        return legacy;
+    }
+    QDir().rmdir(QFileInfo(legacy).absolutePath());
+    return current;
+}
+
+void migrateLegacySettings()
+{
+    QSettings current(QStringLiteral("PastaShelf"), QStringLiteral("PastaShelf"));
+    if (!current.allKeys().isEmpty())
+        return;
+
+    const QList<QPair<QString, QString>> candidates = {
+        {QStringLiteral("PastaShelf"), QStringLiteral("PastaShelfNative")},
+        {QStringLiteral("PasteShelf"), QStringLiteral("PasteShelfNative")},
+    };
+    for (const auto &[organization, application] : candidates) {
+        QSettings legacy(organization, application);
+        const QStringList keys = legacy.allKeys();
+        if (keys.isEmpty())
+            continue;
+        for (const QString &key : keys)
+            current.setValue(key, legacy.value(key));
+        current.sync();
+        return;
+    }
+}
 
 QString compactText(const QString &text, int maximum = 72)
 {
@@ -601,7 +678,7 @@ public:
             return Qt::IgnoreAction;
 
         // Moving a pinned card would immediately make the retained reference
-        // stale. Likewise, PasteShelf-owned payloads must remain in its private
+        // stale. Likewise, PastaShelf-owned payloads must remain in its private
         // content directory until their card is removed. Only advertise Move
         // when every selected item is an existing, ordinary file-system entry.
         bool selectedAny = false;
@@ -734,7 +811,7 @@ private:
         if (parseError.error != QJsonParseError::NoError || !document.isObject()
             || document.object().value(QStringLiteral("version")).toInt(-1) != 1) {
             m_storageWritable = false;
-            qWarning("PasteShelf Native left an invalid or unsupported state file untouched.");
+            qWarning("PastaShelf left an invalid or unsupported state file untouched.");
             return;
         }
         bool normalizedLegacyUrls = false;
@@ -863,6 +940,12 @@ void goToSource(const ShelfItem &item)
         QDesktopServices::openUrl(QUrl::fromLocalFile(info.absoluteFilePath()));
         return;
     }
+#ifdef Q_OS_MACOS
+    if (QProcess::startDetached(QStringLiteral("/usr/bin/open"),
+            {QStringLiteral("-R"), info.absoluteFilePath()})) {
+        return;
+    }
+#endif
     const QString dolphin = QStandardPaths::findExecutable(QStringLiteral("dolphin"));
     if (!dolphin.isEmpty()
         && QProcess::startDetached(dolphin, {QStringLiteral("--select"), info.absoluteFilePath()}))
@@ -949,7 +1032,7 @@ public:
         int y = anchorRect.top();
         y = std::clamp(y, available.top() + 8, available.bottom() - height() - 8);
         m_authoritativeGeometry = QRect(x, y, width(), height());
-        setWindowTitle(QStringLiteral("PasteShelfPreview@%1,%2,%3,%4")
+        setWindowTitle(QStringLiteral("PastaShelfPreview@%1,%2,%3,%4")
             .arg(x).arg(y).arg(width()).arg(height()));
         move(x, y);
         show();
@@ -1300,7 +1383,7 @@ public:
             showHoverPreview();
         if (m_previewPopup) {
             m_previewPopup->grab().save(path);
-            qInfo() << "PasteShelf visual test card=" << frameGeometry()
+            qInfo() << "PastaShelf visual test card=" << frameGeometry()
                     << "preview=" << m_previewPopup->frameGeometry();
         }
     }
@@ -1674,7 +1757,7 @@ public:
         if (m_gdbus.isEmpty())
             return;
         const QString runtime = QStandardPaths::writableLocation(QStandardPaths::RuntimeLocation);
-        m_scriptPath = runtime + QStringLiteral("/pasteshelf-native-positioner.js");
+        m_scriptPath = runtime + QStringLiteral("/pastashelf-positioner.js");
         QSaveFile file(m_scriptPath);
         if (!file.open(QIODevice::WriteOnly))
             return;
@@ -1694,7 +1777,7 @@ public:
     }
 
 private:
-    static QString pluginName() { return QStringLiteral("pasteshelf-native-positioner"); }
+    static QString pluginName() { return QStringLiteral("pastashelf-positioner"); }
 
     void unload()
     {
@@ -1724,7 +1807,7 @@ const watched = new Map();
 const applying = new Set();
 function desiredGeometry(window) {
     const caption = window.caption || "";
-    const match = caption.match(/^PasteShelf(?:Native|Preview|Handle)@(-?\d+),(-?\d+),(\d+),(\d+)/);
+    const match = caption.match(/^PastaShelf(?:Preview|Handle)?@(-?\d+),(-?\d+),(\d+),(\d+)/);
     if (!match) return null;
     const values = match.slice(1).map(Number);
     return {x: values[0], y: values[1], width: Math.max(1, values[2]), height: Math.max(1, values[3])};
@@ -1846,13 +1929,13 @@ class ShelfWindow final : public QWidget {
     Q_OBJECT
 public:
     explicit ShelfWindow(ShelfStore *store)
-        : m_store(store), m_settings(QStringLiteral("PasteShelf"), QStringLiteral("PasteShelfNative"))
+        : m_store(store), m_settings(QStringLiteral("PastaShelf"), QStringLiteral("PastaShelf"))
     {
         setAcceptDrops(true);
         setMouseTracking(true);
-        setWindowFlags(Qt::Window | Qt::FramelessWindowHint | Qt::WindowStaysOnTopHint);
+        setWindowFlags(shelfSurfaceFlags());
         setAttribute(Qt::WA_TranslucentBackground);
-        setWindowIcon(QIcon::fromTheme(QString::fromLatin1(kDesktopId), QIcon::fromTheme(QStringLiteral("edit-paste"))));
+        setWindowIcon(QApplication::windowIcon());
 
         m_placement = m_settings.value(QStringLiteral("window/placement"), QStringLiteral("right-center")).toString();
         m_screenName = m_settings.value(QStringLiteral("window/screen")).toString();
@@ -2082,10 +2165,10 @@ public slots:
 
     void saveVisualTestImages()
     {
-        grab().save(QStringLiteral("/tmp/pasteshelf-native-self-main.png"));
-        m_handle->grab().save(QStringLiteral("/tmp/pasteshelf-native-self-handle.png"));
+        grab().save(QStringLiteral("/tmp/pastashelf-self-main.png"));
+        m_handle->grab().save(QStringLiteral("/tmp/pastashelf-self-handle.png"));
         if (auto *card = findChild<CardWidget *>())
-            card->savePreviewForTest(QStringLiteral("/tmp/pasteshelf-native-self-preview.png"));
+            card->savePreviewForTest(QStringLiteral("/tmp/pastashelf-self-preview.png"));
     }
 
     void runVisualCountdownTest()
@@ -2094,14 +2177,14 @@ public slots:
         openShelf();
         QTimer::singleShot(300, this, [this] {
             m_hoveredWidgets.clear();
-            m_handle->grab().save(QStringLiteral("/tmp/pasteshelf-handle-full.png"));
+            m_handle->grab().save(QStringLiteral("/tmp/pastashelf-handle-full.png"));
             armCloseCountdown();
         });
         QTimer::singleShot(2550, this, [this] {
-            m_handle->grab().save(QStringLiteral("/tmp/pasteshelf-handle-half.png"));
+            m_handle->grab().save(QStringLiteral("/tmp/pastashelf-handle-half.png"));
         });
         QTimer::singleShot(3550, this, [this] {
-            m_handle->grab().save(QStringLiteral("/tmp/pasteshelf-handle-empty.png"));
+            m_handle->grab().save(QStringLiteral("/tmp/pastashelf-handle-empty.png"));
         });
     }
 
@@ -2152,8 +2235,8 @@ protected:
         auto *widget = qobject_cast<QWidget *>(watched);
         if (widget && ownsWidget(widget)) {
             if (event->type() == QEvent::Enter) {
-                if (!widget->property("pasteshelfHoverTracked").toBool()) {
-                    widget->setProperty("pasteshelfHoverTracked", true);
+                if (!widget->property("pastashelfHoverTracked").toBool()) {
+                    widget->setProperty("pastashelfHoverTracked", true);
                     m_hoverTrackedWidgets.insert(widget);
                     connect(widget, &QObject::destroyed, this, [this, widget] {
                         m_hoverTrackedWidgets.remove(widget);
@@ -2523,7 +2606,7 @@ private:
     void createHandle()
     {
         m_handle = new HandleFrame;
-        m_handle->setWindowFlags(Qt::Window | Qt::FramelessWindowHint | Qt::WindowStaysOnTopHint);
+        m_handle->setWindowFlags(shelfSurfaceFlags());
         m_handle->setAttribute(Qt::WA_TranslucentBackground);
         m_handle->setAcceptDrops(true);
         m_handle->setMouseTracking(true);
@@ -2567,12 +2650,9 @@ private:
         root->setSpacing(9);
 
         auto *header = new QHBoxLayout;
-        auto *heading = new QLabel(QStringLiteral("PasteShelf"), m_panel);
+        auto *heading = new QLabel(QStringLiteral("PastaShelf"), m_panel);
         heading->setObjectName(QStringLiteral("heading"));
         header->addWidget(heading);
-        auto *badge = new QLabel(QStringLiteral("NATIVE"), m_panel);
-        badge->setObjectName(QStringLiteral("nativeBadge"));
-        header->addWidget(badge);
         header->addStretch();
         auto *pasteButton = new QToolButton(m_panel);
         pasteButton->setObjectName(QStringLiteral("pasteButton"));
@@ -2669,7 +2749,6 @@ private:
         setStyleSheet(QStringLiteral(R"CSS(
             #panel { background: %1; border: 1px solid %6; border-radius: 14px; }
             #heading { color: %3; font-size: 18px; font-weight: 700; }
-            #nativeBadge { color: %7; background: %5; border-radius: 7px; padding: 2px 7px; font-size: 8px; font-weight: 700; }
             #pasteButton { color: %3; background: %2; border: 1px solid %6; border-radius: 7px; padding: 2px 8px; font-weight: 600; }
             #pasteButton:hover { border-color: %5; background: %1; }
             #newTextButton { color: %3; background: %2; border: 1px solid %6; border-radius: 7px; font-size: 19px; font-weight: 600; }
@@ -2916,7 +2995,7 @@ private:
         const int handleX = handleTopLeft.x();
         const int handleY = handleTopLeft.y();
 
-        m_handle->setWindowTitle(QStringLiteral("PasteShelfHandle@%1,%2,%3,%4")
+        m_handle->setWindowTitle(QStringLiteral("PastaShelfHandle@%1,%2,%3,%4")
             .arg(handleX).arg(handleY).arg(kHandleWidth).arg(kHandleHeight));
         m_handle->move(handleX, handleY);
 
@@ -2936,7 +3015,7 @@ private:
             }
         }
         layoutSurfaces();
-        setWindowTitle(QStringLiteral("PasteShelfNative@%1,%2,%3,%4")
+        setWindowTitle(QStringLiteral("PastaShelf@%1,%2,%3,%4")
             .arg(surfaceTopLeft.x()).arg(surfaceTopLeft.y()).arg(width()).arg(height()));
         move(surfaceTopLeft);
     }
@@ -3039,7 +3118,7 @@ private:
             return;
         QMessageBox confirmation(
             QMessageBox::Question,
-            QStringLiteral("Clear PasteShelf Native?"),
+            QStringLiteral("Clear PastaShelf?"),
             QStringLiteral("Remove every item from the optimized test shelf? Original files will not be deleted."),
             QMessageBox::Cancel,
             this);
@@ -3177,13 +3256,13 @@ private:
         if (!QSystemTrayIcon::isSystemTrayAvailable())
             return;
         m_tray = new QSystemTrayIcon(windowIcon(), this);
-        m_tray->setToolTip(QStringLiteral("PasteShelf Native (optimized test build)"));
+        m_tray->setToolTip(QStringLiteral("PastaShelf"));
         auto *menu = new QMenu(this);
         QAction *newText = menu->addAction(QStringLiteral("New text note…"));
         connect(newText, &QAction::triggered, this, &ShelfWindow::showNewTextNoteDialog);
         QAction *clipboard = menu->addAction(QStringLiteral("Add clipboard"));
         connect(clipboard, &QAction::triggered, this, &ShelfWindow::addClipboardContent);
-        QAction *show = menu->addAction(QStringLiteral("Show PasteShelf Native"));
+        QAction *show = menu->addAction(QStringLiteral("Show PastaShelf"));
         connect(show, &QAction::triggered, this, &ShelfWindow::openShelf);
         QAction *clear = menu->addAction(QStringLiteral("Clear…"));
         connect(clear, &QAction::triggered, this, &ShelfWindow::confirmClear);
@@ -3240,9 +3319,9 @@ class SingleInstance final : public QObject {
 public:
     explicit SingleInstance(QObject *parent = nullptr)
         : QObject(parent),
-          m_name(QStringLiteral("pasteshelf-native-%1").arg(QString::number(getuid()))),
-          m_lockPath(QStandardPaths::writableLocation(QStandardPaths::RuntimeLocation)
-                     + QLatin1Char('/') + m_name + QStringLiteral(".lock")),
+          m_name(QStringLiteral("pastashelf-%1").arg(QString::number(getuid()))),
+          m_lockPath(runtimeDirectory() + QLatin1Char('/') + m_name
+                     + QStringLiteral(".lock")),
           m_lock(m_lockPath)
     {
         connect(&m_server, &QLocalServer::newConnection, this, [this] {
@@ -3321,8 +3400,8 @@ bool runSelfTest()
     {
         ShelfStore store(directory.path());
         QMimeData mime;
-        mime.setText(QStringLiteral("Native text round trip"));
-        mime.setHtml(QStringLiteral("<b>Native text round trip</b>"));
+        mime.setText(QStringLiteral("Text round trip"));
+        mime.setHtml(QStringLiteral("<b>Text round trip</b>"));
         if (!store.add(&mime) || store.groups().size() != 1)
             return false;
         textGroupId = store.groups().first().id;
@@ -4058,7 +4137,7 @@ void addVisualTestData(ShelfStore &store)
     QPainter painter(&image);
     painter.setPen(QColor(QStringLiteral("#f5d85b")));
     painter.setFont(QFont(QStringLiteral("Sans Serif"), 42, QFont::Bold));
-    painter.drawText(image.rect(), Qt::AlignCenter, QStringLiteral("PasteShelf Native"));
+    painter.drawText(image.rect(), Qt::AlignCenter, QStringLiteral("PastaShelf"));
     painter.end();
     QMimeData imageMime;
     imageMime.setImageData(image);
@@ -4079,17 +4158,19 @@ void addVisualTestData(ShelfStore &store)
 int main(int argc, char **argv)
 {
     QApplication app(argc, argv);
-    QCoreApplication::setOrganizationName(QStringLiteral("PasteShelf"));
-    QCoreApplication::setOrganizationDomain(QStringLiteral("io.github.pasteshelf"));
-    QCoreApplication::setApplicationName(QStringLiteral("PasteShelfNative"));
-    QApplication::setApplicationDisplayName(QStringLiteral("PasteShelf Native"));
+    QCoreApplication::setOrganizationName(QStringLiteral("PastaShelf"));
+    QCoreApplication::setOrganizationDomain(QStringLiteral("io.github.pastashelf"));
+    QCoreApplication::setApplicationName(QStringLiteral("PastaShelf"));
+    QApplication::setApplicationDisplayName(QStringLiteral("PastaShelf"));
     QApplication::setDesktopFileName(QString::fromLatin1(kDesktopId));
+    QApplication::setWindowIcon(QIcon(QString::fromLatin1(kBundledIcon)));
     QApplication::setQuitOnLastWindowClosed(false);
+    migrateLegacySettings();
 
     const QStringList arguments = app.arguments();
     if (arguments.contains(QStringLiteral("--self-test"))) {
         const bool passed = runSelfTest();
-        qInfo("PasteShelf Native self-test: %s", passed ? "PASS" : "FAIL");
+        qInfo("PastaShelf self-test: %s", passed ? "PASS" : "FAIL");
         return passed ? 0 : 1;
     }
 
@@ -4097,7 +4178,7 @@ int main(int argc, char **argv)
     if (!arguments.contains(QStringLiteral("--no-single-instance")) && !instance.acquire())
         return 0;
 
-    const QString dataRoot = QStandardPaths::writableLocation(QStandardPaths::AppDataLocation);
+    const QString dataRoot = migrateLegacyData();
     ShelfStore store(dataRoot);
     if (arguments.contains(QStringLiteral("--visual-test"))
         || arguments.contains(QStringLiteral("--visual-stack-test")))
