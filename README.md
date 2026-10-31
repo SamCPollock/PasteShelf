@@ -91,7 +91,7 @@ a normal `.app` bundle, a menu-bar icon, the same edge handle, and Finder's
 - One-click clipboard copy and quick text-note creation
 - Screen and edge selection
 - Tray controls
-- Scaled-at-decode thumbnails with no polling loop
+- Scaled-at-decode thumbnails
 
 Double-click a copied or created text card to edit it in place. The complete
 stack or an individual expanded member can be dragged out.

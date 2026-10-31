@@ -20,6 +20,7 @@
 #include <QFrame>
 #include <QGraphicsOpacityEffect>
 #include <QGuiApplication>
+#include <QHoverEvent>
 #include <QImageReader>
 #include <QJsonArray>
 #include <QJsonDocument>
@@ -1933,6 +1934,7 @@ public:
     {
         setAcceptDrops(true);
         setMouseTracking(true);
+        setAttribute(Qt::WA_Hover);
         setWindowFlags(shelfSurfaceFlags());
         setAttribute(Qt::WA_TranslucentBackground);
         setWindowIcon(QApplication::windowIcon());
@@ -1977,6 +1979,16 @@ public:
         });
         m_toastTimer.setSingleShot(true);
         connect(&m_toastTimer, &QTimer::timeout, m_toast, &QWidget::hide);
+#ifdef Q_OS_MACOS
+        // Cocoa can occasionally omit an enter/leave transition for an
+        // inactive borderless window, especially while another application
+        // owns a native drag. Reconcile only the small edge handle at a low
+        // frequency so hover-to-open remains dependable in those cases.
+        m_pointerPresenceTimer.setInterval(100);
+        connect(&m_pointerPresenceTimer, &QTimer::timeout,
+            this, &ShelfWindow::reconcileMacPointerPresence);
+        m_pointerPresenceTimer.start();
+#endif
 
         connect(qApp, &QGuiApplication::screenAdded, this, [this] { updatePositionTitle(); });
         connect(qApp, &QGuiApplication::screenRemoved, this, [this] { updatePositionTitle(); });
@@ -2234,29 +2246,12 @@ protected:
             return QWidget::eventFilter(watched, event);
         auto *widget = qobject_cast<QWidget *>(watched);
         if (widget && ownsWidget(widget)) {
-            if (event->type() == QEvent::Enter) {
-                if (!widget->property("pastashelfHoverTracked").toBool()) {
-                    widget->setProperty("pastashelfHoverTracked", true);
-                    m_hoverTrackedWidgets.insert(widget);
-                    connect(widget, &QObject::destroyed, this, [this, widget] {
-                        m_hoverTrackedWidgets.remove(widget);
-                        m_hoveredWidgets.remove(widget);
-                        scheduleCloseAfterPointerLeave();
-                    });
-                }
-                m_hoveredWidgets.insert(widget);
-                if (m_manualCollapse)
-                    return QWidget::eventFilter(watched, event);
-                if (!m_expanded) {
-                    m_hoverOpenTimer.start();
-                } else {
-                    cancelCloseCountdown();
-                    if (m_animating)
-                        openShelf();
-                }
-            } else if (event->type() == QEvent::Leave || event->type() == QEvent::Hide) {
-                m_hoveredWidgets.remove(widget);
-                scheduleCloseAfterPointerLeave();
+            if (event->type() == QEvent::Enter || event->type() == QEvent::HoverEnter
+                || event->type() == QEvent::HoverMove) {
+                notePointerEntered(widget);
+            } else if (event->type() == QEvent::Leave
+                || event->type() == QEvent::HoverLeave || event->type() == QEvent::Hide) {
+                notePointerLeft(widget);
             }
         }
         return QWidget::eventFilter(watched, event);
@@ -2264,23 +2259,13 @@ protected:
 
     void enterEvent(QEnterEvent *event) override
     {
-        if (m_manualCollapse) {
-            QWidget::enterEvent(event);
-            return;
-        }
-        if (!m_expanded) {
-            m_hoverOpenTimer.start();
-        } else {
-            cancelCloseCountdown();
-            if (m_animating)
-                openShelf();
-        }
+        notePointerEntered(this);
         QWidget::enterEvent(event);
     }
 
     void leaveEvent(QEvent *event) override
     {
-        scheduleCloseAfterPointerLeave();
+        notePointerLeft(this);
         QWidget::leaveEvent(event);
     }
 
@@ -2297,6 +2282,10 @@ protected:
             event->accept();
             return;
         }
+        // Open on drag presence even if a platform has not exposed its full
+        // MIME payload yet. A later move/drop is still accepted only after
+        // ShelfStore confirms that the data can be imported.
+        openShelf();
         if (!ShelfStore::canImport(event->mimeData())) {
             event->ignore();
             return;
@@ -2455,6 +2444,68 @@ private:
         return false;
     }
 
+    void notePointerEntered(QWidget *widget)
+    {
+        if (!widget || !ownsWidget(widget))
+            return;
+        if (!widget->property("pastashelfHoverTracked").toBool()) {
+            widget->setProperty("pastashelfHoverTracked", true);
+            m_hoverTrackedWidgets.insert(widget);
+            connect(widget, &QObject::destroyed, this, [this, widget] {
+                m_hoverTrackedWidgets.remove(widget);
+                m_hoveredWidgets.remove(widget);
+                scheduleCloseAfterPointerLeave();
+            });
+        }
+        const bool wasHovered = m_hoveredWidgets.contains(widget);
+        m_hoveredWidgets.insert(widget);
+        if (m_manualCollapse)
+            return;
+        if (!m_expanded) {
+            if (!wasHovered && !m_hoverOpenTimer.isActive())
+                m_hoverOpenTimer.start();
+        } else {
+            cancelCloseCountdown();
+            if (m_animating)
+                openShelf();
+        }
+    }
+
+    void notePointerLeft(QWidget *widget)
+    {
+        if (!widget)
+            return;
+        m_hoveredWidgets.remove(widget);
+        scheduleCloseAfterPointerLeave();
+    }
+
+    void reconcileMacPointerPresence()
+    {
+#ifdef Q_OS_MACOS
+        if (!m_handle || !m_handle->isVisible())
+            return;
+        const QRect handleGeometry(m_handle->mapToGlobal(QPoint(0, 0)), m_handle->size());
+        const bool pointerInside = handleGeometry.contains(QCursor::pos());
+        if (pointerInside && QGuiApplication::mouseButtons() != Qt::NoButton && !m_expanded)
+            openShelf();
+        if (pointerInside == m_macPointerInsideHandle)
+            return;
+        m_macPointerInsideHandle = pointerInside;
+        if (pointerInside) {
+            notePointerEntered(m_handle);
+            return;
+        }
+        for (auto it = m_hoveredWidgets.begin(); it != m_hoveredWidgets.end();) {
+            QWidget *widget = *it;
+            if (widget == m_handle || (widget && m_handle->isAncestorOf(widget)))
+                it = m_hoveredWidgets.erase(it);
+            else
+                ++it;
+        }
+        scheduleCloseAfterPointerLeave();
+#endif
+    }
+
     void animateHandleFill(qreal target, int duration)
     {
         if (m_handleFillAnimation) {
@@ -2608,6 +2659,7 @@ private:
         m_handle = new HandleFrame;
         m_handle->setWindowFlags(shelfSurfaceFlags());
         m_handle->setAttribute(Qt::WA_TranslucentBackground);
+        m_handle->setAttribute(Qt::WA_Hover);
         m_handle->setAcceptDrops(true);
         m_handle->setMouseTracking(true);
         m_handle->setFixedSize(kHandleWidth, kHandleHeight);
@@ -3301,6 +3353,7 @@ private:
     QTimer m_drainDelayTimer;
     QTimer m_hoverOpenTimer;
     QTimer m_toastTimer;
+    QTimer m_pointerPresenceTimer;
     QString m_internalReorderGroupId;
     QString m_placement;
     QString m_screenName;
@@ -3311,6 +3364,7 @@ private:
     bool m_animating = false;
     bool m_manualCollapse = false;
     bool m_ignoreHoverForTest = false;
+    bool m_macPointerInsideHandle = false;
     qreal m_openProgress = 0.0;
 };
 
@@ -3985,7 +4039,8 @@ bool runSelfTest()
         auto *panel = shelf.findChild<QWidget *>(QStringLiteral("panel"));
         if (!pasteButton || !newTextButton || newTextButton->toolTip() != QStringLiteral("New text note")
             || !shrinkButton || shrinkButton->toolTip() != QStringLiteral("Shrink shelf")
-            || !handleLock || !handle || !dropHint || !dropHint->isHidden()
+            || !handleLock || !handle || !shelf.testAttribute(Qt::WA_Hover)
+            || !handle->testAttribute(Qt::WA_Hover) || !dropHint || !dropHint->isHidden()
             || !toast || !toast->isHidden() || !panel || panel->layout()->indexOf(toast) >= 0
             || toast->geometry().center().y() < panel->height() / 2) {
             return false;
@@ -4009,6 +4064,21 @@ bool runSelfTest()
             || shelf.expandedForTest() || shelf.panelVisibleForTest()) {
             return false;
         }
+
+        QMimeData deferredDragPayload;
+        deferredDragPayload.setData("application/x-pastashelf-deferred", "pending");
+        QDragEnterEvent deferredDragEnter(QPoint(5, 5), Qt::CopyAction,
+            &deferredDragPayload, Qt::LeftButton, Qt::NoModifier);
+        QApplication::sendEvent(handle, &deferredDragEnter);
+        QApplication::processEvents();
+        if (deferredDragEnter.isAccepted() || !shelf.expandedForTest())
+            return false;
+        shrinkButton->click();
+        QEventLoop deferredDragCloseWait;
+        QTimer::singleShot(260, &deferredDragCloseWait, &QEventLoop::quit);
+        deferredDragCloseWait.exec();
+        if (shelf.expandedForTest() || shelf.panelVisibleForTest())
+            return false;
 
         QMimeData draggedText;
         draggedText.setText(QStringLiteral("Handle drag forwarding"));
@@ -4250,8 +4320,9 @@ int main(int argc, char **argv)
             *quickPassStayedClosed = !window.expandedForTest();
         });
         QTimer::singleShot(520, &window, [&window] {
-            QEnterEvent enter(QPointF(4, 4), QPointF(4, 4), QPointF(4, 4));
-            QApplication::sendEvent(window.handleWidgetForTest(), &enter);
+            QHoverEvent hoverEnter(QEvent::HoverEnter, QPointF(4, 4), QPointF(4, 4),
+                QPointF(-1, -1), Qt::NoModifier);
+            QApplication::sendEvent(window.handleWidgetForTest(), &hoverEnter);
         });
         QTimer::singleShot(700, &window, [&window, deliberateHoverStayedClosedInitially] {
             *deliberateHoverStayedClosedInitially = !window.expandedForTest();
